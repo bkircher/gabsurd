@@ -1,0 +1,3 @@
+[submodule "vendor/absurd"]
+	path = vendor/absurd
+	url = git@github.com:earendil-works/absurd.git

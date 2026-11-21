@@ -2,8 +2,10 @@
 //// Provides functions for emitting and awaiting events.
 
 import gabsurd/client.{type Db, type GabsurdError}
-import gabsurd/sql
+import gabsurd/internal/query
+import gabsurd/internal/sql
 import gleam/json
+import gleam/option
 import gleam/result
 
 /// Result of an await_event call.
@@ -18,10 +20,8 @@ pub fn emit(
   event_name: String,
   payload: json.Json,
 ) -> Result(Nil, GabsurdError) {
-  client.exec(
-    db,
-    sql.emit_event(queue_name, event_name, json.to_string(payload)),
-  )
+  sql.emit_event(client.connection(db), queue_name, event_name, payload)
+  |> query.exec
 }
 
 /// Await an event for a specific task step.
@@ -36,9 +36,23 @@ pub fn await(
   event_name: String,
   timeout: Int,
 ) -> Result(AwaitResult, GabsurdError) {
-  use row <- result.try(client.query_one(
-    db,
-    sql.await_event(queue_name, task_id, run_id, step_name, event_name, timeout),
+  use task_id <- result.try(query.uuid_from_bits(task_id))
+  use run_id <- result.try(query.uuid_from_bits(run_id))
+  use row <- result.try(
+    sql.await_event(
+      client.connection(db),
+      queue_name,
+      task_id,
+      run_id,
+      step_name,
+      event_name,
+      timeout,
+    )
+    |> query.one,
+  )
+  // Keep the legacy payload until the public API has a timeout outcome.
+  Ok(AwaitResult(
+    should_suspend: row.should_suspend,
+    payload: option.unwrap(row.payload, "{}"),
   ))
-  Ok(AwaitResult(should_suspend: row.should_suspend, payload: row.payload))
 }

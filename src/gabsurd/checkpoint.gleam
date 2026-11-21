@@ -11,10 +11,13 @@
 //// operation without checkpoints, see `gabsurd/task.extend_claim`.
 
 import gabsurd/client.{type Db, type GabsurdError, NotFound}
-import gabsurd/sql
+import gabsurd/internal/query
+import gabsurd/internal/sql
 import gleam/json
 import gleam/option
+import gleam/result
 import gleam/time/timestamp.{type Timestamp}
+import youid/uuid
 
 /// A checkpoint record.
 pub type Checkpoint {
@@ -41,17 +44,18 @@ pub fn set(
   owner_run_id: BitArray,
   extend_claim_by: Int,
 ) -> Result(Nil, GabsurdError) {
-  client.exec(
-    db,
-    sql.set_task_checkpoint_state(
-      queue_name,
-      task_id,
-      step_name,
-      json.to_string(state),
-      owner_run_id,
-      extend_claim_by,
-    ),
+  use task_id <- result.try(query.uuid_from_bits(task_id))
+  use owner_run_id <- result.try(query.uuid_from_bits(owner_run_id))
+  sql.set_task_checkpoint_state(
+    client.connection(db),
+    queue_name,
+    task_id,
+    step_name,
+    state,
+    owner_run_id,
+    extend_claim_by,
   )
+  |> query.exec
 }
 
 /// Get a checkpoint for a task step.
@@ -64,24 +68,26 @@ pub fn get(
   step_name: String,
   include_pending: Bool,
 ) -> Result(option.Option(Checkpoint), GabsurdError) {
+  use task_id <- result.try(query.uuid_from_bits(task_id))
   case
-    client.query_one(
-      db,
-      sql.get_task_checkpoint_state(
-        queue_name,
-        task_id,
-        step_name,
-        include_pending,
-      ),
+    sql.get_task_checkpoint_state(
+      client.connection(db),
+      queue_name,
+      task_id,
+      step_name,
+      include_pending,
     )
+    |> query.one
   {
     Ok(row) ->
       Ok(
         option.Some(Checkpoint(
           checkpoint_name: row.checkpoint_name,
-          state: row.state,
+          state: option.unwrap(row.state, "{}"),
           status: row.status,
-          owner_run_id: row.owner_run_id,
+          owner_run_id: row.owner_run_id
+            |> option.map(uuid.to_bit_array)
+            |> option.unwrap(<<0:128>>),
           updated_at: row.updated_at,
         )),
       )

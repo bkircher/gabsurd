@@ -4,17 +4,16 @@ import gabsurd/client
 import gabsurd/event
 import gabsurd/queue
 import gabsurd/task
+import gabsurd/test_support
 import gleam/bit_array
 import gleam/erlang/process
 import gleam/json
 import gleam/list
 import gleeunit/should
 
-const db_url = "postgresql://gabsurd:gabsurd@127.0.0.1:5432/gabsurd"
-
 /// Helper: start a DB connection + create a queue, return both.
 fn setup(queue_name: String) -> #(client.Db, String) {
-  let assert Ok(started) = client.start(db_url)
+  let assert Ok(started) = client.start(test_support.database_url())
   let db = started.data
   let assert Ok(Nil) = queue.create(db, queue_name)
   #(db, queue_name)
@@ -69,6 +68,11 @@ pub fn claim_task_test() {
   claim.task_name |> should.equal("claimable_task")
   claim.attempt |> should.equal(1)
   claim.run_id |> should.equal(task_info.run_id)
+  claim.retry_strategy |> should.equal("{}")
+  claim.max_attempts |> should.equal(0)
+  claim.headers |> should.equal("{}")
+  claim.wake_event |> should.equal("")
+  claim.event_payload |> should.equal("{}")
 
   teardown(db, q)
 }
@@ -106,6 +110,28 @@ pub fn fail_run_test() {
   teardown(db, q)
 }
 
+pub fn retry_failed_task_test() {
+  let #(db, q) = setup("test_retry")
+  let assert Ok(spawned) =
+    task.spawn(
+      db,
+      q,
+      "retry_task",
+      json.null(),
+      task.new_options() |> task.with_max_attempts(1),
+    )
+  let assert Ok([claim]) = task.claim(db, q, "worker", 30, 1)
+  let assert Ok(Nil) = task.fail(db, q, claim.run_id, json.string("failure"))
+
+  let assert Ok(retry) = task.retry(db, q, spawned.task_id, task.new_options())
+
+  retry.task_id |> should.equal(spawned.task_id)
+  retry.attempt |> should.equal(2)
+  retry.created |> should.be_false
+
+  teardown(db, q)
+}
+
 pub fn cancel_task_test() {
   let #(db, q) = setup("test_cancel")
 
@@ -117,6 +143,16 @@ pub fn cancel_task_test() {
 }
 
 /// Task reads expose routing metadata and every practical task state.
+pub fn cancel_task_rejects_partial_uuid_test() {
+  let #(db, q) = setup("test_cancel_partial_uuid")
+
+  let outcome = task.cancel(db, q, <<0:127>>)
+
+  outcome |> should.equal(Error(client.QueryError("invalid UUID")))
+
+  teardown(db, q)
+}
+
 pub fn task_result_states_test() {
   let #(db, q) = setup("test_result_states")
   let headers = json.object([#("source", json.string("test"))])
@@ -215,6 +251,8 @@ pub fn task_result_states_test() {
   let missing_queue = "test_result_missing"
   let assert Ok(Nil) = queue.create(db, missing_queue)
   task.get_result(db, missing_queue, pending.task_id)
+  |> should.equal(Error(client.NotFound))
+  task.get_result(db, missing_queue, <<0:128>>)
   |> should.equal(Error(client.NotFound))
   let _ = queue.drop(db, missing_queue)
   teardown(db, q)

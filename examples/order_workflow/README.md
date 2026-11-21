@@ -1,19 +1,19 @@
 # Order Processing Workflow
 
-A comprehensive example that demonstrates all major gabsurd patterns in a single realistic order-processing pipeline.
+An example that demonstrates all major gabsurd patterns in a single realistic order-processing pipeline.
 
 ## What It Shows
 
-| Pattern | Where in `src/order_workflow.gleam` |
-|---------|------|
-| **Idempotent steps** | `context.step(ctx, "charge", ..., fn() { ... })` — skips on retry |
-| **Passing data between steps** | Step 1 saves `charge_id` to checkpoint; step 2 reads it back |
-| **Continuation-based decoders** | `charge_id_decoder()` uses `use id <- decode.field(...)` syntax |
-| **Event-driven coordination** | `context.await_event(ctx, ...)` → suspends until webhook fires |
-| **WorkflowResult type** | `Done` / `WaitEvent` — clean mapping to `Complete` / `Suspend` |
-| **Idempotent task spawning** | `task.with_idempotency_key("order-" <> id)` prevents duplicates |
-| **Worker lifecycle** | `worker.start(config)` → `started.data` → `worker.stop(w)` |
-| **on_error hook** | Logs task name and reason JSON when the handler returns `Fail` |
+| Pattern                         | Where in `src/order_workflow.gleam`                               |
+| ------------------------------- | ----------------------------------------------------------------- |
+| **Idempotent steps**            | `context.step(ctx, "charge", ..., fn() { ... })` — skips on retry |
+| **Passing data between steps**  | Step 1 saves `charge_id` to checkpoint; step 2 reads it back      |
+| **Continuation-based decoders** | `charge_id_decoder()` uses `use id <- decode.field(...)` syntax   |
+| **Event-driven coordination**   | `context.await_event(ctx, ...)` → suspends until webhook fires    |
+| **WorkflowResult type**         | `Done` / `WaitEvent` — clean mapping to `Complete` / `Suspend`    |
+| **Idempotent task spawning**    | `task.with_idempotency_key("order-" <> id)` prevents duplicates   |
+| **Worker lifecycle**            | `worker.start(config)` → `started.data` → `worker.stop(w)`        |
+| **on_error hook**               | Logs task name and reason JSON when the handler returns `Fail`    |
 
 ## Workflow Steps
 
@@ -77,25 +77,15 @@ worker.stop(w)
 
 ## Running
 
-Requires a running PostgreSQL with the Absurd schema loaded (same DB as the main project):
+Use the main project's database (from the Compose file). Run these commands from the repository root:
 
 ```bash
-# From the repo root — start the database and load the schema
-mise run db
-mise run db-reset
+# Start PostgreSQL and load the schemas if the data directory is empty
+docker compose up -d --wait db
 
-# Then run the example
+# Run the example
 cd examples/order_workflow
 gleam run -m order_workflow
-```
-
-Or use the mise tasks from the repo root:
-
-```bash
-mise run example-build
-mise run example-format
-mise run example-check
-mise run example-run
 ```
 
 ## Expected Output

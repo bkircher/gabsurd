@@ -2,15 +2,14 @@
 
 import gabsurd/client
 import gabsurd/queue
+import gabsurd/test_support
 import gleam/erlang/process
 import gleam/io
 import gleam/list
 import gleeunit/should
 
-const db_url = "postgresql://gabsurd:gabsurd@127.0.0.1:5432/gabsurd"
-
 pub fn integration_test() {
-  let assert Ok(started) = client.start(db_url)
+  let assert Ok(started) = client.start(test_support.database_url())
   let db = started.data
 
   // Create a queue

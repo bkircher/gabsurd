@@ -3,6 +3,7 @@
 import gabsurd/client
 import gabsurd/queue
 import gabsurd/task
+import gabsurd/test_support
 import gabsurd/worker.{type Handler, Complete, Fail, Handler}
 import gleam/erlang/process
 import gleam/json
@@ -10,8 +11,6 @@ import gleam/list
 import gleam/option
 import gleam/otp/static_supervisor
 import gleeunit/should
-
-const db_url = "postgresql://gabsurd:gabsurd@127.0.0.1:5432/gabsurd"
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -33,7 +32,7 @@ fn tracking_handler(
 }
 
 fn setup(queue_name: String) -> #(client.Db, String) {
-  let assert Ok(started) = client.start(db_url)
+  let assert Ok(started) = client.start(test_support.database_url())
   let db = started.data
   let assert Ok(Nil) = queue.create(db, queue_name)
   #(db, queue_name)

@@ -2,14 +2,13 @@
 
 import gabsurd/client
 import gabsurd/queue
+import gabsurd/test_support
 import gleam/erlang/process
 import gleam/list
 import gleeunit/should
 
-const db_url = "postgresql://gabsurd:gabsurd@127.0.0.1:5432/gabsurd"
-
 pub fn create_queue_test() {
-  let assert Ok(started) = client.start(db_url)
+  let assert Ok(started) = client.start(test_support.database_url())
   let db = started.data
 
   queue.create(db, "test_create") |> should.be_ok
@@ -22,7 +21,7 @@ pub fn create_queue_test() {
 }
 
 pub fn drop_queue_test() {
-  let assert Ok(started) = client.start(db_url)
+  let assert Ok(started) = client.start(test_support.database_url())
   let db = started.data
 
   let assert Ok(Nil) = queue.create(db, "test_drop")
@@ -34,7 +33,7 @@ pub fn drop_queue_test() {
 }
 
 pub fn list_queues_test() {
-  let assert Ok(started) = client.start(db_url)
+  let assert Ok(started) = client.start(test_support.database_url())
   let db = started.data
 
   let assert Ok(Nil) = queue.create(db, "test_list_a")
@@ -50,7 +49,7 @@ pub fn list_queues_test() {
 }
 
 pub fn create_queue_with_mode_test() {
-  let assert Ok(started) = client.start(db_url)
+  let assert Ok(started) = client.start(test_support.database_url())
   let db = started.data
 
   queue.create_with_mode(db, "test_partitioned", "partitioned")

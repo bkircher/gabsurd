@@ -1,4 +1,4 @@
--- Local SQL extensions for gabsurd. Keep priv/absurd.sql untouched.
+-- Local SQL extensions for gabsurd. Keep upstream SQL in vendor/absurd unchanged.
 --
 -- Exposes task routing metadata alongside Absurd's task result without exposing
 -- task params. The dynamic table name is validated and quoted before use.

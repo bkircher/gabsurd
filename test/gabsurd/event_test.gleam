@@ -4,15 +4,14 @@ import gabsurd/client
 import gabsurd/event
 import gabsurd/queue
 import gabsurd/task
+import gabsurd/test_support
 import gleam/erlang/process
 import gleam/json
 import gleam/list
 import gleeunit/should
 
-const db_url = "postgresql://gabsurd:gabsurd@127.0.0.1:5432/gabsurd"
-
 fn setup(queue_name: String) -> #(client.Db, String) {
-  let assert Ok(started) = client.start(db_url)
+  let assert Ok(started) = client.start(test_support.database_url())
   let db = started.data
   let assert Ok(Nil) = queue.create(db, queue_name)
   #(db, queue_name)
@@ -43,6 +42,19 @@ pub fn emit_event_null_payload_test() {
   teardown(db, q)
 }
 
+pub fn emit_invalid_event_returns_database_error_test() {
+  let #(db, q) = setup("test_emit_invalid")
+
+  let outcome = event.emit(db, q, "", json.null())
+
+  outcome
+  |> should.equal(
+    Error(client.QueryError("P0001: event_name must be provided")),
+  )
+
+  teardown(db, q)
+}
+
 /// Test that await_event returns should_suspend=true when no event is pending
 pub fn await_event_no_event_test() {
   let #(db, q) = setup("test_await_noevent")
@@ -57,6 +69,7 @@ pub fn await_event_no_event_test() {
   let assert Ok(result) =
     event.await(db, q, spawned.task_id, claim.run_id, "step1", "my_event", 1)
   result.should_suspend |> should.be_true
+  result.payload |> should.equal("{}")
 
   teardown(db, q)
 }

@@ -3,13 +3,15 @@
 //// failing, and cancelling tasks.
 
 import gabsurd/client.{type Db, type GabsurdError}
-import gabsurd/sql
+import gabsurd/internal/query
+import gabsurd/internal/sql
 import gleam/json
 import gleam/list
 import gleam/option
 import gleam/result
 import gleam/time/duration
 import gleam/time/timestamp
+import youid/uuid
 
 // ============================================================================
 // Public Types
@@ -141,6 +143,10 @@ pub fn with_idempotency_key(
 
 /// Encode spawn options to a JSON string for the database.
 pub fn encode_options(options: SpawnOptions) -> String {
+  options_json(options) |> json.to_string
+}
+
+fn options_json(options: SpawnOptions) -> json.Json {
   let entries = []
   let entries = case options.max_attempts {
     option.Some(max) -> [#("max_attempts", json.int(max)), ..entries]
@@ -165,7 +171,7 @@ pub fn encode_options(options: SpawnOptions) -> String {
     option.Some(key) -> [#("idempotency_key", json.string(key)), ..entries]
     option.None -> entries
   }
-  json.to_string(json.object(entries))
+  json.object(entries)
 }
 
 fn encode_retry_strategy(strategy: RetryStrategy) -> json.Json {
@@ -225,15 +231,19 @@ pub fn spawn(
   params: json.Json,
   options: SpawnOptions,
 ) -> Result(SpawnInfo, GabsurdError) {
-  let params_str = json.to_string(params)
-  let options_str = encode_options(options)
-  use row <- result.try(client.query_one(
-    db,
-    sql.spawn_task(queue_name, task_name, params_str, options_str),
-  ))
+  use row <- result.try(
+    sql.spawn_task(
+      client.connection(db),
+      queue_name,
+      task_name,
+      params,
+      options_json(options),
+    )
+    |> query.one,
+  )
   Ok(SpawnInfo(
-    task_id: row.task_id,
-    run_id: row.run_id,
+    task_id: uuid.to_bit_array(row.task_id),
+    run_id: uuid.to_bit_array(row.run_id),
     attempt: row.attempt,
     created: row.created,
   ))
@@ -247,23 +257,29 @@ pub fn claim(
   claim_timeout: Int,
   qty: Int,
 ) -> Result(List(Claim), GabsurdError) {
-  use rows <- result.try(client.query_many(
-    db,
-    sql.claim_task(queue_name, worker_id, claim_timeout, qty),
-  ))
+  use rows <- result.try(
+    sql.claim_task(
+      client.connection(db),
+      queue_name,
+      worker_id,
+      claim_timeout,
+      qty,
+    )
+    |> query.many,
+  )
   Ok(
     list.map(rows, fn(row) {
       Claim(
-        run_id: row.run_id,
-        task_id: row.task_id,
+        run_id: uuid.to_bit_array(row.run_id),
+        task_id: uuid.to_bit_array(row.task_id),
         attempt: row.attempt,
         task_name: row.task_name,
         params: row.params,
-        retry_strategy: row.retry_strategy,
-        max_attempts: row.max_attempts,
-        headers: row.headers,
-        wake_event: row.wake_event,
-        event_payload: row.event_payload,
+        retry_strategy: option.unwrap(row.retry_strategy, "{}"),
+        max_attempts: option.unwrap(row.max_attempts, 0),
+        headers: option.unwrap(row.headers, "{}"),
+        wake_event: option.unwrap(row.wake_event, ""),
+        event_payload: option.unwrap(row.event_payload, "{}"),
       )
     }),
   )
@@ -276,7 +292,9 @@ pub fn complete(
   run_id: BitArray,
   state: json.Json,
 ) -> Result(Nil, GabsurdError) {
-  client.exec(db, sql.complete_run(queue_name, run_id, json.to_string(state)))
+  use run_id <- result.try(query.uuid_from_bits(run_id))
+  sql.complete_run(client.connection(db), queue_name, run_id, state)
+  |> query.exec
 }
 
 /// Mark a run as failed with a reason.
@@ -287,7 +305,9 @@ pub fn fail(
   run_id: BitArray,
   reason: json.Json,
 ) -> Result(Nil, GabsurdError) {
-  client.exec(db, sql.fail_run(queue_name, run_id, json.to_string(reason)))
+  use run_id <- result.try(query.uuid_from_bits(run_id))
+  sql.fail_run(client.connection(db), queue_name, run_id, reason)
+  |> query.exec
 }
 
 /// Mark a run as failed and schedule a retry at a specific time.
@@ -298,15 +318,15 @@ pub fn fail_with_retry(
   reason: json.Json,
   retry_at: timestamp.Timestamp,
 ) -> Result(Nil, GabsurdError) {
-  client.exec(
-    db,
-    sql.fail_run_with_retry(
-      queue_name,
-      run_id,
-      json.to_string(reason),
-      retry_at,
-    ),
+  use run_id <- result.try(query.uuid_from_bits(run_id))
+  sql.fail_run_with_retry(
+    client.connection(db),
+    queue_name,
+    run_id,
+    reason,
+    retry_at,
   )
+  |> query.exec
 }
 
 /// Extend a worker's claim lease on a run by `extend_by` seconds.
@@ -323,7 +343,9 @@ pub fn extend_claim(
   run_id: BitArray,
   extend_by: Int,
 ) -> Result(Nil, GabsurdError) {
-  client.exec(db, sql.extend_claim(queue_name, run_id, extend_by))
+  use run_id <- result.try(query.uuid_from_bits(run_id))
+  sql.extend_claim(client.connection(db), queue_name, run_id, extend_by)
+  |> query.exec
 }
 
 /// Schedule a run to become available again at a future time.
@@ -336,9 +358,11 @@ pub fn schedule_run(
   run_id: BitArray,
   defer_seconds: Int,
 ) -> Result(Nil, GabsurdError) {
+  use run_id <- result.try(query.uuid_from_bits(run_id))
   let now = timestamp.system_time()
   let wake_at = timestamp.add(now, duration.seconds(defer_seconds))
-  client.exec(db, sql.schedule_run(queue_name, run_id, wake_at))
+  sql.schedule_run(client.connection(db), queue_name, run_id, wake_at)
+  |> query.exec
 }
 
 /// Cancel a task by its task_id.
@@ -347,7 +371,8 @@ pub fn cancel(
   queue_name: String,
   task_id: BitArray,
 ) -> Result(Nil, GabsurdError) {
-  client.exec(db, sql.cancel_task(queue_name, task_id))
+  use task_id <- result.try(query.uuid_from_bits(task_id))
+  sql.cancel_task(client.connection(db), queue_name, task_id) |> query.exec
 }
 
 /// Get the current state and terminal payload of a task in any lifecycle state.
@@ -362,16 +387,16 @@ pub fn get_result(
   queue_name: String,
   task_id: BitArray,
 ) -> Result(TaskResult, GabsurdError) {
-  use row <- result.try(client.query_one(
-    db,
-    sql.get_task_result(queue_name, task_id),
-  ))
+  use task_id <- result.try(query.uuid_from_bits(task_id))
+  use row <- result.try(
+    sql.get_task_result(client.connection(db), queue_name, task_id) |> query.one,
+  )
   Ok(TaskResult(
     task_name: row.task_name,
     headers: row.headers,
     state: row.state,
-    result: row.result,
-    failure_reason: row.failure_reason,
+    result: option.unwrap(row.result, "{}"),
+    failure_reason: option.unwrap(row.failure_reason, "{}"),
   ))
 }
 
@@ -382,14 +407,19 @@ pub fn retry(
   task_id: BitArray,
   options: SpawnOptions,
 ) -> Result(SpawnInfo, GabsurdError) {
-  let options_str = encode_options(options)
-  use row <- result.try(client.query_one(
-    db,
-    sql.retry_task(queue_name, task_id, options_str),
-  ))
+  use task_id <- result.try(query.uuid_from_bits(task_id))
+  use row <- result.try(
+    sql.retry_task(
+      client.connection(db),
+      queue_name,
+      task_id,
+      options_json(options),
+    )
+    |> query.one,
+  )
   Ok(SpawnInfo(
-    task_id: row.task_id,
-    run_id: row.run_id,
+    task_id: uuid.to_bit_array(row.task_id),
+    run_id: uuid.to_bit_array(row.run_id),
     attempt: row.attempt,
     created: row.created,
   ))

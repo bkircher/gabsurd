@@ -1,31 +1,32 @@
 name = "gabsurd"
 version = "0.2.0"
 
-description = "A Gleam SDK for the Absurd durable workflow system, with type-safe database access via Parrot and OTP worker actors"
+description = "A Gleam SDK for the Absurd durable workflow system, with type-safe database access via Squirrel and OTP worker actors"
 licences = ["Apache-2.0"]
 repository = { type = "github", user = "kasuboski", repo = "gabsurd" }
 links = [
   { title = "Absurd", href = "https://github.com/absurd-sql/absurd" },
-  { title = "Parrot", href = "https://github.com/daniellionel01/parrot" },
+  { title = "Squirrel", href = "https://github.com/giacomocavalieri/squirrel" },
 ]
 
 [dependencies]
 gleam_stdlib = ">= 1.0.0 and < 2.0.0"
-parrot = ">= 2.2.1 and < 3.0.0"
 pog = ">= 4.1.0 and < 5.0.0"
 gleam_time = ">= 1.8.0 and < 2.0.0"
 gleam_erlang = ">= 1.3.0 and < 2.0.0"
 gleam_otp = ">= 1.2.0 and < 2.0.0"
 envoy = ">= 1.2.0 and < 2.0.0"
 gleam_json = ">= 3.1.0 and < 4.0.0"
+youid = ">= 1.6.1 and < 2.0.0"
 
 [dev_dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"
 glinter = ">= 2.19.2 and < 3.0.0"
+squirrel = "== 4.7.0"
 
 [tools.glinter]
-# Parrot owns this generated module; lint the handwritten API around it.
-exclude = ["src/gabsurd/sql.gleam"]
+# Squirrel owns this generated module. Lint only the handwritten code.
+exclude = ["src/gabsurd/internal/sql.gleam"]
 
 [tools.glinter.ignore]
 # Gleeunit discovers exported test functions, and assertions are the test

@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          otp-version: "29.1.2"
+          gleam-version: "1.19.2"
+          rebar3-version: "3.28.0"
+          version-type: strict
+
+      - run: gleam format --check src test
+
+      - name: Check generated queries and run tests
+        run: |
+          source .envrc
+          docker compose up -d --wait db
+          gleam run -m squirrel check
+          gleam test
+
+      - name: Build the example
+        working-directory: examples/order_workflow
+        run: gleam build

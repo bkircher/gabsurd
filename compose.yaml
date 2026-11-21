@@ -1,0 +1,30 @@
+services:
+  db:
+    image: postgres:19-trixie@sha256:bb6e70add742cd868fb62cb3b2f67d1dd2bdd2b65a521e778420748753687c60
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready --host=127.0.0.1
+          --username="$$POSTGRES_USER" --dbname="$$POSTGRES_DB"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      restart_policy:
+        condition: on-failure
+    environment:
+      POSTGRES_USER: ${DB_USER:?Set DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASS:?Set DB_PASS}
+      POSTGRES_DB: ${DB_NAME:?Set DB_NAME}
+      PGDATA: /var/lib/postgresql/19/docker
+    ports:
+      - "127.0.0.1:${DB_PORT:?Set DB_PORT}:5432"
+    volumes:
+      - db_data:/var/lib/postgresql
+      - ./priv/stubs.sql:/docker-entrypoint-initdb.d/01-stubs.sql:ro
+      - ./vendor/absurd/sql/absurd.sql:/docker-entrypoint-initdb.d/02-absurd.sql:ro
+      - ./priv/gabsurd.sql:/docker-entrypoint-initdb.d/03-gabsurd.sql:ro
+
+volumes:
+  db_data:
