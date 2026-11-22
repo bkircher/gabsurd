@@ -18,6 +18,7 @@ jobs:
           persist-credentials: false
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        id: setup-beam
         with:
           otp-version: "29.1.2"
           gleam-version: "1.19.2"
@@ -25,6 +26,23 @@ jobs:
           version-type: strict
 
       - run: gleam format --check src test
+
+      - name: Cache dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # Keep the compiler fingerprint, but rebuild local packages on every run.
+          path: |
+            build/dev/erlang/*
+            !build/dev/erlang/gabsurd
+            examples/order_workflow/build/dev/erlang/*
+            !examples/order_workflow/build/dev/erlang/gabsurd
+            !examples/order_workflow/build/dev/erlang/order_workflow
+          key: >-
+            ${{ format('gleam-deps-v1-{0}-{1}-gleam-{2}-otp-{3}-rebar3-{4}-{5}',
+              runner.os, runner.arch, steps.setup-beam.outputs.gleam-version,
+              steps.setup-beam.outputs.otp-version, steps.setup-beam.outputs.rebar3-version,
+              hashFiles('gleam.toml', 'manifest.toml',
+                'examples/order_workflow/gleam.toml', 'examples/order_workflow/manifest.toml')) }}
 
       - run: make build
 
