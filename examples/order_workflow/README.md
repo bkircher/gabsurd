@@ -4,16 +4,16 @@ An example that demonstrates all major gabsurd patterns in a single realistic or
 
 ## What It Shows
 
-| Pattern                         | Where in `src/order_workflow.gleam`                               |
-| ------------------------------- | ----------------------------------------------------------------- |
-| **Idempotent steps**            | `context.step(ctx, "charge", ..., fn() { ... })` — skips on retry |
-| **Passing data between steps**  | Step 1 saves `charge_id` to checkpoint; step 2 reads it back      |
-| **Continuation-based decoders** | `charge_id_decoder()` uses `use id <- decode.field(...)` syntax   |
-| **Event-driven coordination**   | `context.await_event(ctx, ...)` → suspends until webhook fires    |
-| **WorkflowResult type**         | `Done` / `WaitEvent` — clean mapping to `Complete` / `Suspend`    |
-| **Idempotent task spawning**    | `task.with_idempotency_key("order-" <> id)` prevents duplicates   |
-| **Worker lifecycle**            | `worker.start(config)` → `started.data` → `worker.stop(w)`        |
-| **on_error hook**               | Logs task name and reason JSON when the handler returns `Fail`    |
+| Pattern                         | Where in `src/order_workflow.gleam`                                   |
+| ------------------------------- | --------------------------------------------------------------------- |
+| **Idempotent steps**            | `context.step(ctx, "charge", ..., fn() { ... })` — skips on retry     |
+| **Passing data between steps**  | Step 1 saves `charge_id` to checkpoint; step 2 reads it back          |
+| **Continuation-based decoders** | `charge_id_decoder()` uses `use id <- decode.field(...)` syntax       |
+| **Event-driven coordination**   | `context.await_event(ctx, ...)` → suspends until webhook fires        |
+| **Workflow outcomes**           | `Done`, `WaitEvent`, and `PaymentTimedOut`                            |
+| **Idempotent task spawning**    | `task.with_idempotency_key("order-" <> id)` prevents duplicates       |
+| **Worker lifecycle**            | `worker.start(config)` → `worker.stop_and_wait(running_worker, 5000)` |
+| **on_error hook**               | Logs task name and reason JSON when the handler returns `Fail`        |
 
 ## Workflow Steps
 
@@ -22,7 +22,9 @@ spawn task → charge card → capture charge → reserve inventory
            → await payment webhook → send confirmation email
 ```
 
-If the worker crashes at any point, the task is retried. Completed steps are skipped via checkpoints — only the remaining work runs.
+If the task fails, the worker retries it while attempts remain. On retry,
+the workflow reads saved checkpoints and skips completed steps. Use a
+stable, unique name for each step.
 
 ### API patterns used
 
@@ -56,10 +58,11 @@ use charge_id <- result.try(
   }),
 )
 
-// Event-driven — context.await_event returns Received or Suspended
-case context.await_event(ctx, "payment_confirmed_" <> order_id, 3600) {
-  Ok(context.Received(_payload)) -> Ok(Done)
-  Ok(context.Suspended) -> Ok(WaitEvent)
+// Wait up to one hour. Use option.None for a wait without a deadline.
+case context.await_event(ctx, "payment_confirmed_" <> order_id, option.Some(3600)) {
+  Ok(event.Received(_payload)) -> Ok(Done)
+  Ok(event.Suspended) -> Ok(WaitEvent)
+  Ok(event.TimedOut) -> Ok(PaymentTimedOut)
   Error(e) -> Error(e)
 }
 
@@ -67,12 +70,13 @@ case context.await_event(ctx, "payment_confirmed_" <> order_id, 3600) {
 event.emit(db, "orders", "payment_confirmed_" <> order_id, json.object([...]))
 
 // Worker setup — start returns actor.StartResult(Worker)
+let assert Ok(poll_interval) = worker.delay_ms(500)
 let config = worker.new(db, "orders", [handler])
-  |> worker.with_poll_interval(500)
+  |> worker.with_poll_interval(poll_interval)
 let assert Ok(started) = worker.start(config)
-let w = started.data
+let running_worker = started.data
 // ... later:
-worker.stop(w)
+let assert Ok(Nil) = worker.stop_and_wait(running_worker, 5000)
 ```
 
 ## Running

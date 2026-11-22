@@ -3,7 +3,6 @@
 import gabsurd/client
 import gabsurd/internal/sql
 import gabsurd/test_support
-import gleam/erlang/process
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
@@ -18,22 +17,16 @@ const start_time = "2025-01-02T03:04:05.123456Z"
 const due_time = "2025-01-02T03:05:05.123456Z"
 
 fn with_queue(name: String, check: fn(pog.Connection, String) -> Nil) -> Nil {
-  let assert Ok(started) = client.start(test_support.database_url())
-
-  // Roll back each fixture, including its queue and session settings.
-  let outcome =
-    pog.transaction(client.connection(started.data), fn(db) {
-      set_local(db, "absurd.fake_now", start_time)
-      let assert Ok(_) = sql.create_queue(db, name)
-      check(db, name)
-      Error(Nil)
-    })
-
-  process.send_exit(started.pid)
-  outcome |> should.equal(Error(pog.TransactionRolledBack(Nil)))
+  use db, queue <- test_support.with_transaction_queue(name)
+  test_support.set_time(db:, at: start_time)
+  check(client.connection(db), queue)
 }
 
-fn set_local(db: pog.Connection, setting: String, value: String) -> Nil {
+fn set_local(
+  db db: pog.Connection,
+  setting setting: String,
+  value value: String,
+) -> Nil {
   let assert Ok(_) =
     pog.query("SELECT set_config($1, $2, true)")
     |> pog.parameter(pog.text(setting))
@@ -52,7 +45,7 @@ fn claimed_task(db: pog.Connection, queue: String) -> sql.ClaimTaskRow {
   claim
 }
 
-pub fn claim_preserves_optional_values_test() {
+pub fn claim_preserves_optional_values_test() -> Nil {
   use db, queue <- with_queue("squirrel_claim")
   sql.claim_task(db, queue, "worker", 30, 2)
   |> should.equal(Ok(pog.Returned(0, [])))
@@ -92,7 +85,7 @@ pub fn claim_preserves_optional_values_test() {
   second.retry_strategy |> should.equal(Some("{\"kind\": \"fixed\"}"))
 }
 
-pub fn timed_wait_preserves_sql_null_on_timeout_test() {
+pub fn timed_wait_preserves_sql_null_on_timeout_test() -> Nil {
   use db, queue <- with_queue("squirrel_timed_wait")
   let claim = claimed_task(db, queue)
 
@@ -116,7 +109,7 @@ pub fn timed_wait_preserves_sql_null_on_timeout_test() {
   |> should.equal(Ok(pog.Returned(1, [sql.AwaitEventRow(False, None)])))
 }
 
-pub fn unlimited_wait_resumes_on_json_null_event_test() {
+pub fn unlimited_wait_resumes_on_json_null_event_test() -> Nil {
   use db, queue <- with_queue("squirrel_unlimited_wait")
   let claim = claimed_task(db, queue)
 
@@ -152,7 +145,7 @@ pub fn unlimited_wait_resumes_on_json_null_event_test() {
   )
 }
 
-pub fn await_decodes_json_object_test() {
+pub fn await_decodes_json_object_test() -> Nil {
   use db, queue <- with_queue("squirrel_object_event")
   let claim = claimed_task(db, queue)
   let assert Ok(_) =
@@ -167,7 +160,7 @@ pub fn await_decodes_json_object_test() {
   )
 }
 
-pub fn checkpoint_reads_preserve_null_values_test() {
+pub fn checkpoint_reads_preserve_null_values_test() -> Nil {
   use db, queue <- with_queue("squirrel_checkpoint_null")
   let claim = claimed_task(db, queue)
   sql.get_task_checkpoint_state(db, queue, claim.task_id, "missing", False)
@@ -191,22 +184,20 @@ pub fn checkpoint_reads_preserve_null_values_test() {
     |> pog.parameter(pog.text(uuid.to_string(claim.run_id)))
     |> pog.execute(db)
 
-  let assert Ok(pog.Returned(2, rows)) =
-    sql.get_task_checkpoint_states(db, queue, claim.task_id, claim.run_id)
+  let assert Ok(pog.Returned(1, [json_row])) =
+    sql.get_task_checkpoint_state(db, queue, claim.task_id, "json_null", False)
+  let assert Ok(pog.Returned(1, [sql_row])) =
+    sql.get_task_checkpoint_state(db, queue, claim.task_id, "sql_null", False)
 
-  let assert [json_row, sql_row] =
-    list.sort(rows, fn(a, b) {
-      string.compare(a.checkpoint_name, b.checkpoint_name)
-    })
   json_row.state |> should.equal(Some("null"))
   sql_row.state |> should.equal(None)
 }
 
-pub fn checkpoint_timestamp_is_independent_of_session_zone_test() {
+pub fn checkpoint_timestamp_is_independent_of_session_zone_test() -> Nil {
   use db, queue <- with_queue("squirrel_checkpoint_zone")
   let claim = claimed_task(db, queue)
   let assert Ok(expected) = timestamp.parse_rfc3339(start_time)
-  set_local(db, "TimeZone", "UTC")
+  set_local(db:, setting: "TimeZone", value: "UTC")
   let assert Ok(_) =
     sql.set_task_checkpoint_state(
       db,
@@ -220,7 +211,7 @@ pub fn checkpoint_timestamp_is_independent_of_session_zone_test() {
 
   let assert Ok(pog.Returned(1, [utc])) =
     sql.get_task_checkpoint_state(db, queue, claim.task_id, "step", False)
-  set_local(db, "TimeZone", "America/Los_Angeles")
+  set_local(db:, setting: "TimeZone", value: "America/Los_Angeles")
   let assert Ok(pog.Returned(1, [local])) =
     sql.get_task_checkpoint_state(db, queue, claim.task_id, "step", False)
 
@@ -229,27 +220,110 @@ pub fn checkpoint_timestamp_is_independent_of_session_zone_test() {
   local.owner_run_id |> should.equal(Some(claim.run_id))
 }
 
-pub fn schedule_run_respects_timestamp_in_non_utc_zone_test() {
+pub fn guarded_deferral_uses_database_time_in_a_non_utc_zone_test() -> Nil {
   use db, queue <- with_queue("squirrel_schedule_zone")
   let claim = claimed_task(db, queue)
-  let assert Ok(due) = timestamp.parse_rfc3339(due_time)
-  set_local(db, "TimeZone", "America/Los_Angeles")
+  set_local(db:, setting: "TimeZone", value: "America/Los_Angeles")
 
-  let assert Ok(_) = sql.schedule_run(db, queue, claim.run_id, due)
+  let write = sql.schedule_run_if_claimed(db, queue, claim.run_id, "worker", 60)
 
+  write
+  |> should.equal(Ok(pog.Returned(1, [sql.ScheduleRunIfClaimedRow(True)])))
+  set_local(
+    db:,
+    setting: "absurd.fake_now",
+    value: "2025-01-02T03:05:05.123455Z",
+  )
   sql.claim_task(db, queue, "worker", 30, 1)
   |> should.equal(Ok(pog.Returned(0, [])))
-  set_local(db, "absurd.fake_now", due_time)
+  set_local(db:, setting: "absurd.fake_now", value: due_time)
   let assert Ok(pog.Returned(1, [resumed])) =
     sql.claim_task(db, queue, "worker", 30, 1)
   resumed.run_id |> should.equal(claim.run_id)
 }
 
-pub fn fail_run_respects_retry_timestamp_in_non_utc_zone_test() {
+pub fn expired_claim_cannot_defer_a_run_test() -> Nil {
+  use db, queue <- with_queue("squirrel_schedule_expired")
+  let claim = claimed_task(db, queue)
+  set_local(
+    db:,
+    setting: "absurd.fake_now",
+    value: "2025-01-02T03:04:35.123456Z",
+  )
+
+  let write = sql.schedule_run_if_claimed(db, queue, claim.run_id, "worker", 60)
+
+  write
+  |> should.equal(Ok(pog.Returned(1, [sql.ScheduleRunIfClaimedRow(False)])))
+  let assert Ok(pog.Returned(1, [outcome])) =
+    sql.get_task_result(db, queue, claim.task_id)
+  outcome.state |> should.equal("running")
+}
+
+pub fn previous_claim_cannot_defer_a_run_with_a_new_owner_test() -> Nil {
+  use db, queue <- with_queue("squirrel_schedule_old")
+  let old = claimed_task(db, queue)
+  let assert Ok(_) = sql.schedule_run(db, queue, old.run_id, 0)
+  let assert Ok(pog.Returned(1, [resumed])) =
+    sql.claim_task(db, queue, "worker-2", 30, 1)
+
+  let write = sql.schedule_run_if_claimed(db, queue, old.run_id, "worker", 60)
+
+  resumed.run_id |> should.equal(old.run_id)
+  write
+  |> should.equal(Ok(pog.Returned(1, [sql.ScheduleRunIfClaimedRow(False)])))
+  let assert Ok(pog.Returned(1, [outcome])) =
+    sql.get_task_result(db, queue, old.task_id)
+  outcome.state |> should.equal("running")
+}
+
+pub fn expired_claim_cannot_record_a_handler_failure_test() -> Nil {
+  use db, queue <- with_queue("squirrel_expired_claim")
+  let claim = claimed_task(db, queue)
+  set_local(db:, setting: "absurd.fake_now", value: due_time)
+
+  let write =
+    sql.fail_run_if_claimed(
+      db,
+      queue,
+      claim.run_id,
+      "worker",
+      json.string("Handler crash"),
+    )
+
+  write |> should.equal(Ok(pog.Returned(1, [sql.FailRunIfClaimedRow(False)])))
+  let assert Ok(pog.Returned(1, [outcome])) =
+    sql.get_task_result(db, queue, claim.task_id)
+  outcome.state |> should.equal("running")
+}
+
+pub fn expired_claim_cannot_record_a_handler_completion_test() -> Nil {
+  use db, queue <- with_queue("squirrel_expired_completion")
+  let claim = claimed_task(db, queue)
+  set_local(db:, setting: "absurd.fake_now", value: due_time)
+
+  let write =
+    sql.complete_run_if_claimed(
+      db,
+      queue,
+      claim.run_id,
+      "worker",
+      json.string("late result"),
+    )
+
+  write
+  |> should.equal(Ok(pog.Returned(1, [sql.CompleteRunIfClaimedRow(False)])))
+  let assert Ok(pog.Returned(1, [outcome])) =
+    sql.get_task_result(db, queue, claim.task_id)
+  outcome.state |> should.equal("running")
+  outcome.result |> should.equal(None)
+}
+
+pub fn fail_run_respects_retry_timestamp_in_non_utc_zone_test() -> Nil {
   use db, queue <- with_queue("squirrel_retry_zone")
   let claim = claimed_task(db, queue)
   let assert Ok(due) = timestamp.parse_rfc3339(due_time)
-  set_local(db, "TimeZone", "America/Los_Angeles")
+  set_local(db:, setting: "TimeZone", value: "America/Los_Angeles")
 
   let assert Ok(_) =
     sql.fail_run_with_retry(
@@ -262,7 +336,7 @@ pub fn fail_run_respects_retry_timestamp_in_non_utc_zone_test() {
 
   sql.claim_task(db, queue, "worker", 30, 1)
   |> should.equal(Ok(pog.Returned(0, [])))
-  set_local(db, "absurd.fake_now", due_time)
+  set_local(db:, setting: "absurd.fake_now", value: due_time)
   let assert Ok(pog.Returned(1, [retried])) =
     sql.claim_task(db, queue, "worker", 30, 1)
   retried.task_id |> should.equal(claim.task_id)

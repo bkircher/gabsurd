@@ -35,7 +35,7 @@ const db_url = "postgresql://gabsurd:gabsurd@127.0.0.1:5432/gabsurd"
 // Entry Point
 // ============================================================================
 
-pub fn main() {
+pub fn main() -> Nil {
   io.println("=== gabsurd order_workflow example ===")
   io.println("")
 
@@ -56,7 +56,7 @@ pub fn main() {
       db,
       "orders",
       "process_order",
-      order_params(order_id, 2999, "alice@example.com"),
+      order_params(order_id:, amount: 2999, email: "alice@example.com"),
       task.new_options()
         |> task.with_max_attempts(5)
         |> task.with_idempotency_key("order-" <> order_id),
@@ -64,13 +64,14 @@ pub fn main() {
   io.println("[main] Spawned task: attempt=" <> int.to_string(info.attempt))
 
   // --- 4. Start the worker ---
+  let assert Ok(poll_interval) = worker.delay_ms(500)
   let config =
     worker.new(db, "orders", [process_order_handler()])
-    |> worker.with_poll_interval(500)
+    |> worker.with_poll_interval(poll_interval)
     |> worker.with_batch_size(10)
 
   let assert Ok(started) = worker.start(config)
-  let w = started.data
+  let running_worker = started.data
   io.println("[main] Worker started.")
   io.println("[main] Waiting for steps 1-3 (charge, capture, reserve)...")
   io.println("")
@@ -105,15 +106,20 @@ pub fn main() {
   // --- 6. Check the result ---
   let assert Ok(task_result) = task.get_result(db, "orders", info.task_id)
   io.println("")
-  io.println(
-    "[main] Task result: state="
-    <> task_result.state
-    <> " result="
-    <> task_result.result,
-  )
+  case task_result {
+    task.Completed(result: payload, ..) ->
+      io.println(
+        "[main] Task completed: " <> option.unwrap(payload, "(no result)"),
+      )
+    task.Failed(failure_reason: reason, ..) ->
+      io.println("[main] Task failed: " <> option.unwrap(reason, "(no reason)"))
+    task.Cancelled(..) -> io.println("[main] Task cancelled.")
+    task.Pending(..) | task.Running(..) | task.Sleeping(..) ->
+      io.println("[main] Task has not finished.")
+  }
 
   // --- 7. Clean up ---
-  worker.stop(w)
+  let assert Ok(Nil) = worker.stop_and_wait(running_worker, 5000)
   io.println("")
   io.println("=== Done! ===")
 }
@@ -123,17 +129,10 @@ pub fn main() {
 // ============================================================================
 
 /// The worker handler that dispatches to our workflow.
-pub fn process_order_handler() -> Handler {
+fn process_order_handler() -> Handler {
   Handler(
     task_name: "process_order",
-    execute: fn(ctx) {
-      case order_workflow(ctx) {
-        Ok(Done) ->
-          Complete(json.object([#("status", json.string("completed"))]))
-        Ok(WaitEvent) -> Suspend
-        Error(e) -> Fail(json.string(error_to_string(e)))
-      }
-    },
+    execute: execute_order,
     on_error: option.Some(fn(ctx, reason) {
       io.println("[on_error] task failed: " <> context.task_name(ctx))
       io.println("[on_error] reason: " <> json.to_string(reason))
@@ -141,15 +140,31 @@ pub fn process_order_handler() -> Handler {
   )
 }
 
+fn execute_order(ctx: context.Context) -> worker.HandlerResult {
+  case json.parse(from: context.params(ctx), using: order_params_decoder()) {
+    Error(error) -> Fail(json.string(order_params_error_message(error)))
+    Ok(params) ->
+      case order_workflow(ctx, params) {
+        Ok(Done) ->
+          Complete(json.object([#("status", json.string("completed"))]))
+        Ok(WaitEvent) -> Suspend
+        Ok(PaymentTimedOut) ->
+          Complete(json.object([#("status", json.string("payment_timed_out"))]))
+        Error(client.TaskCancelled) -> worker.Cancelled
+        Error(error) -> Fail(json.string(client.error_message(error)))
+      }
+  }
+}
+
 // ============================================================================
 // Workflow Result Type
 // ============================================================================
 
-/// Result of the workflow. `Done` means complete the task.
-/// `WaitEvent` means the task is suspended waiting for an event.
-pub type WorkflowResult {
+/// Outcome of the order workflow.
+type WorkflowResult {
   Done
   WaitEvent
+  PaymentTimedOut
 }
 
 // ============================================================================
@@ -168,11 +183,10 @@ pub type WorkflowResult {
 ///   3. Reserve inventory
 ///   4. Wait for external payment confirmation (event-driven)
 ///   5. Send confirmation email
-pub fn order_workflow(
+fn order_workflow(
   ctx: context.Context,
+  params: OrderParams,
 ) -> Result(WorkflowResult, client.GabsurdError) {
-  let params = decode_order_params(context.params(ctx))
-
   // Step 1: Charge the card — returns a charge_id for the next step.
   // On retry, the checkpoint is loaded and charge_card is NOT called again.
   use charge_id <- result.try(
@@ -200,8 +214,14 @@ pub fn order_workflow(
 
   // Step 4: Wait for an external payment confirmation webhook.
   // This suspends the task if the event hasn't arrived yet.
-  case context.await_event(ctx, "payment_confirmed_" <> params.order_id, 3600) {
-    Ok(context.Received(_payload)) -> {
+  case
+    context.await_event(
+      ctx,
+      "payment_confirmed_" <> params.order_id,
+      option.Some(3600),
+    )
+  {
+    Ok(event.Received(_payload)) -> {
       // Event arrived — continue to step 5.
       use _ <- result.try(
         context.step(ctx, "notify", decode.success(Nil), fn() {
@@ -211,12 +231,13 @@ pub fn order_workflow(
       )
       Ok(Done)
     }
-    Ok(context.Suspended) -> {
+    Ok(event.Suspended) -> {
       // No event yet — the worker will leave this task sleeping.
       // When the event fires, this handler runs again and all
       // previous steps are skipped via checkpoints.
       Ok(WaitEvent)
     }
+    Ok(event.TimedOut) -> Ok(PaymentTimedOut)
     Error(e) -> Error(e)
   }
 }
@@ -238,6 +259,17 @@ fn order_params_decoder() -> decode.Decoder(OrderParams) {
   use amount <- decode.field("amount", decode.int)
   use email <- decode.field("email", decode.string)
   decode.success(OrderParams(order_id:, amount:, email:))
+}
+
+fn order_params_error_message(error: json.DecodeError) -> String {
+  case error {
+    json.UnableToDecode(_) ->
+      "Invalid order parameters: expected order_id, amount, and email"
+    json.UnexpectedEndOfInput
+    | json.UnexpectedByte(_)
+    | json.UnexpectedSequence(_) ->
+      "Invalid order parameters: expected valid JSON"
+  }
 }
 
 // ============================================================================
@@ -285,7 +317,11 @@ fn send_confirmation(email: String, order_id: String) -> Nil {
 // ============================================================================
 
 /// Build order params JSON.
-fn order_params(order_id: String, amount: Int, email: String) -> json.Json {
+fn order_params(
+  order_id order_id: String,
+  amount amount: Int,
+  email email: String,
+) -> json.Json {
   json.object([
     #("order_id", json.string(order_id)),
     #("amount", json.int(amount)),
@@ -293,25 +329,9 @@ fn order_params(order_id: String, amount: Int, email: String) -> json.Json {
   ])
 }
 
-/// Decode order params from raw JSON string.
-fn decode_order_params(raw: String) -> OrderParams {
-  let assert Ok(params) = json.parse(raw, order_params_decoder())
-  params
-}
-
 /// Parsed order parameters.
 type OrderParams {
   OrderParams(order_id: String, amount: Int, email: String)
-}
-
-/// Convert a GabsurdError to a readable string.
-fn error_to_string(e: client.GabsurdError) -> String {
-  case e {
-    client.QueryError(reason) -> "query error: " <> reason
-    client.UnexpectedRowCount(reason) -> "unexpected row count: " <> reason
-    client.NotFound -> "not found"
-    client.ConnectionError(reason) -> "connection error: " <> reason
-  }
 }
 
 /// Format cents as a dollar string, e.g. 2999 → "29.99".

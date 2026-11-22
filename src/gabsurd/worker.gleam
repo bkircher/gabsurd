@@ -1,31 +1,37 @@
-//// OTP Worker actor for the Absurd durable workflow system.
-//// Polls a queue for tasks, dispatches to registered handlers,
-//// and completes/fails tasks based on handler results.
+//// OTP worker for the Absurd durable workflow system.
+//// The polling actor claims only as many tasks as it can start.
+//// Each task runs in a separate linked process. The actor handles its exit
+//// so a handler panic does not stop the worker.
+//// An unlinked process kills the task if the worker exits first, even if
+//// the handler traps exits.
 ////
 //// ## Distributed systems behaviour
 ////
-//// - **Claim extension**: The primary lease extension mechanism is
-////   `checkpoint.set`, which passes `claim_timeout` as `extend_claim_by`
-////   to `set_task_checkpoint_state` — every checkpoint write extends the
-////   lease. For handlers doing a single long operation without checkpoints,
-////   the claim timeout is the safety net: if the handler takes too long,
-////   the claim expires and another worker picks up the task.
-//// - **Error backoff**: On transient claim errors, backs off exponentially
-////   up to `max_backoff` (default 60s), resets on success.
+//// - **Claim extension**: `context.set_checkpoint` and `context.heartbeat`
+////   extend the lease only while the handler owns an active claim. Send a
+////   heartbeat before the lease expires during long operations.
+//// - **Claim expiry**: The worker checks leases even when all slots are full.
+////   It stops an expired handler and frees the slot when the process exits.
+////   Absurd records the timeout and applies the retry policy on a claim poll.
+//// - **Error backoff**: The worker increases the delay after a claim or
+////   lease check fails, up to `max_backoff` (default 60s). It resets the delay
+////   when the operation succeeds.
 //// - **Unknown task deferral**: Tasks with no registered handler are deferred
 ////   (rescheduled with a delay) rather than failed. This supports rolling
 ////   deployments where a new task type may arrive before its handler is
 ////   deployed.
-//// - **Terminal state tolerance**: complete/fail errors from already-
-////   completed or already-failed runs are silently ignored (matching the
-////   official Absurd SDK behaviour).
+//// - **Claim ownership**: The worker records results and crashes or defers
+////   unknown tasks only while the claim is still active and owned by this worker.
 
 import gabsurd/client.{
-  type Db, type GabsurdError, ConnectionError, NotFound, QueryError,
-  UnexpectedRowCount,
+  type Db, type GabsurdError, ClaimLost, RunAlreadyFailed, TaskCancelled,
 }
 import gabsurd/context.{type Context}
-import gabsurd/task
+import gabsurd/internal/query
+import gabsurd/internal/sql
+import gabsurd/lease.{type ClaimExpiry}
+import gabsurd/task.{type RunId}
+import gleam/bool
 import gleam/dict
 import gleam/erlang/process
 import gleam/int
@@ -35,7 +41,9 @@ import gleam/list
 import gleam/option
 import gleam/otp/actor
 import gleam/otp/supervision
-import gleam/string
+import gleam/result
+import gleam/set
+import youid/uuid
 
 // ============================================================================
 // Public Types
@@ -45,14 +53,14 @@ import gleam/string
 ///
 /// Return `Complete(result)` to mark the task as successfully done.
 /// Return `Fail(reason)` to mark the task as failed.
-/// Return `Suspend` when the task is waiting for an event — the worker
-/// will skip the complete/fail call so the run stays in `sleeping` state
-/// until `emit_event` wakes it up.
-///
+/// Return `Suspend` when a workflow operation puts the run to sleep.
+/// Return `Cancelled` when the database reports that the task was cancelled.
+/// Neither outcome calls complete or fail. `Cancelled` does not cancel a task.
 pub type HandlerResult {
   Complete(json.Json)
   Fail(json.Json)
   Suspend
+  Cancelled
 }
 
 /// A handler for a specific task type.
@@ -78,7 +86,7 @@ pub type Handler {
     task_name: String,
     /// Execute the task. Receives a `Context` with the claim details,
     /// database connection, and helper methods. Return `Complete`,
-    /// `Fail`, or `Suspend`.
+    /// `Fail`, `Suspend`, or `Cancelled`.
     execute: fn(Context) -> HandlerResult,
     /// Optional hook called when execute returns Fail.
     /// Receives the context and the error json. Use for logging/metrics.
@@ -86,41 +94,73 @@ pub type Handler {
   )
 }
 
+/// A checked delay in milliseconds for a worker timer.
+pub opaque type DelayMs {
+  DelayMs(milliseconds: Int)
+}
+
+/// The delay is outside the range accepted by `delay_ms`.
+pub type DelayError {
+  DelayOutOfRange
+}
+
 /// Worker configuration. Create with `new()` and customize with `with_*` functions.
-pub type Config {
+pub opaque type Config {
   Config(
     db: Db,
     queue_name: String,
     worker_id: String,
-    poll_interval: Int,
-    claim_timeout: Int,
+    poll_interval: DelayMs,
+    claim_expiry: ClaimExpiry,
     batch_size: Int,
-    max_backoff: Int,
+    max_backoff: DelayMs,
     handlers: List(Handler),
   )
 }
 
-/// A running worker actor handle.
-pub type Worker {
-  Worker(subject: process.Subject(Message))
+/// A running worker handle.
+pub opaque type Worker {
+  Worker(pid: process.Pid, subject: process.Subject(Message))
 }
 
-/// Messages the worker actor accepts.
-pub type Message {
+/// The worker did not confirm a graceful shutdown.
+pub type ShutdownError {
+  ShutdownTimedOut
+  WorkerExited(process.ExitReason)
+}
+
+type Message {
   Poll
+  CheckLeases(delay: DelayMs)
   Shutdown
+  LinkedExit(process.ExitMessage)
+}
+
+type PollTiming {
+  Immediate
+  Delayed
 }
 
 // ============================================================================
 // Internal State
 // ============================================================================
 
+type ActiveClaim {
+  ActiveClaim(run_id: RunId, owner: String, timed_out: Bool)
+}
+
 type WorkerState {
   WorkerState(
     config: Config,
     handler_map: dict.Dict(String, Handler),
     subject: process.Subject(Message),
-    consecutive_errors: Int,
+    parent: process.Pid,
+    active: dict.Dict(process.Pid, ActiveClaim),
+    stopping: option.Option(process.ExitReason),
+    // A delayed or queued Poll stays pending until the worker receives it.
+    poll_pending: Bool,
+    lease_check_pending: Bool,
+    retry_delay: DelayMs,
   )
 }
 
@@ -128,69 +168,113 @@ type WorkerState {
 // Configuration
 // ============================================================================
 
+// Use the portable 32-bit timer range. Recent OTP versions can accept
+// longer delays, but their limit depends on the runtime's monotonic clock.
+const max_delay_ms = 4_294_967_295
+
+/// Check that a worker timer delay is between 1 and 4,294,967,295 ms.
+/// Zero would let the worker poll again without a delay.
+pub fn delay_ms(milliseconds: Int) -> Result(DelayMs, DelayError) {
+  use <- bool.guard(
+    when: milliseconds < 1 || milliseconds > max_delay_ms,
+    return: Error(DelayOutOfRange),
+  )
+  Ok(DelayMs(milliseconds))
+}
+
 /// Create a new worker config with defaults.
-pub fn new(db: Db, queue_name: String, handlers: List(Handler)) -> Config {
+pub fn new(
+  db db: Db,
+  queue_name queue_name: String,
+  handlers handlers: List(Handler),
+) -> Config {
   Config(
     db: db,
     queue_name: queue_name,
     worker_id: "gabsurd_worker",
-    poll_interval: 5000,
-    claim_timeout: 30,
+    poll_interval: DelayMs(5000),
+    claim_expiry: lease.default_expiry,
     batch_size: 1,
-    max_backoff: 60_000,
+    max_backoff: DelayMs(60_000),
     handlers: handlers,
   )
 }
 
-/// Set the worker ID (used as `worker_id` in claim_task).
-pub fn with_worker_id(config: Config, worker_id: String) -> Config {
+// nolint: unused_exports -- public API for callers that set a worker ID prefix
+/// Set the worker ID prefix. Each claim batch adds a unique suffix.
+pub fn with_worker_id(
+  config config: Config,
+  worker_id worker_id: String,
+) -> Config {
   Config(..config, worker_id: worker_id)
 }
 
-/// Set the poll interval in milliseconds.
-pub fn with_poll_interval(config: Config, interval_ms: Int) -> Config {
-  Config(..config, poll_interval: interval_ms)
+/// Set the poll interval. Use `delay_ms` to check the interval first.
+pub fn with_poll_interval(
+  config config: Config,
+  interval interval: DelayMs,
+) -> Config {
+  Config(..config, poll_interval: interval)
 }
 
-/// Set the claim timeout in seconds.
-pub fn with_claim_timeout(config: Config, timeout_secs: Int) -> Config {
-  Config(..config, claim_timeout: timeout_secs)
+/// Set claim expiry. Use `lease.NoExpiry` to disable recovery by lease expiry.
+/// The default lease expires after 30 seconds.
+pub fn with_claim_expiry(
+  config config: Config,
+  expiry expiry: ClaimExpiry,
+) -> Config {
+  Config(..config, claim_expiry: expiry)
 }
 
-/// Set the batch size (tasks claimed per poll).
-pub fn with_batch_size(config: Config, size: Int) -> Config {
+/// Set the maximum number of tasks this worker can execute at the same time.
+/// Each poll claims work only for free slots. The minimum capacity is one.
+pub fn with_batch_size(config config: Config, size size: Int) -> Config {
   Config(..config, batch_size: size)
 }
 
-/// Set the maximum backoff in milliseconds for retrying after claim errors.
-/// Default: 60000 (60 seconds).
-pub fn with_max_backoff(config: Config, max_backoff_ms: Int) -> Config {
-  Config(..config, max_backoff: max_backoff_ms)
+// nolint: unused_exports -- public API for callers that set a backoff limit
+/// Set the maximum backoff after claim or lease check errors.
+/// Use `delay_ms` to check the delay first. The default is 60 seconds.
+pub fn with_max_backoff(config config: Config, delay delay: DelayMs) -> Config {
+  Config(..config, max_backoff: delay)
 }
 
 // ============================================================================
 // Lifecycle
 // ============================================================================
 
-/// Start a worker actor.
+/// Start a worker linked to the calling process. The worker drains active
+/// tasks when its parent exits, subject to the supervisor shutdown timeout.
 pub fn start(config: Config) -> actor.StartResult(Worker) {
   let handler_map =
     config.handlers
     |> list.map(fn(h) { #(h.task_name, h) })
     |> dict.from_list()
 
+  let parent = process.self()
   let init = fn(subject: process.Subject(Message)) {
+    // Trap exits from the parent and from the task processes.
+    process.trap_exits(True)
     let state =
       WorkerState(
-        config: config,
-        handler_map: handler_map,
-        subject: subject,
-        consecutive_errors: 0,
+        config:,
+        handler_map:,
+        subject:,
+        parent:,
+        active: dict.new(),
+        stopping: option.None,
+        poll_pending: False,
+        lease_check_pending: False,
+        retry_delay: config.poll_interval,
       )
-    // Schedule first poll
-    let _ = process.send_after(subject, config.poll_interval, Poll)
-    actor.initialised(state)
-    |> actor.returning(Worker(subject: subject))
+    schedule_poll(state, Delayed)
+    |> actor.initialised
+    |> actor.selecting(
+      process.new_selector()
+      |> process.select(subject)
+      |> process.select_trapped_exits(LinkedExit),
+    )
+    |> actor.returning(Worker(pid: process.self(), subject:))
     |> Ok
   }
 
@@ -199,16 +283,36 @@ pub fn start(config: Config) -> actor.StartResult(Worker) {
   |> actor.start()
 }
 
-/// Stop a worker gracefully.
+// nolint: unused_exports -- public API for callers that do not wait for shutdown
+/// Ask the worker to stop claiming tasks and let active tasks finish.
+/// Use `stop_and_wait` to wait for confirmation.
 pub fn stop(worker: Worker) -> Nil {
   process.send(worker.subject, Shutdown)
 }
 
+/// Request shutdown and wait for active tasks to finish and the worker to exit.
+/// A timeout does not kill the worker. If it already exited, this cannot
+/// confirm how it stopped and returns `WorkerExited`.
+pub fn stop_and_wait(
+  worker worker: Worker,
+  timeout_ms timeout_ms: Int,
+) -> Result(Nil, ShutdownError) {
+  let monitor = process.monitor(worker.pid)
+  stop(worker)
+  let outcome =
+    process.new_selector()
+    |> process.select_specific_monitor(monitor, fn(down) { down.reason })
+    |> process.selector_receive(timeout_ms)
+  process.demonitor_process(monitor)
+  case outcome {
+    Ok(process.Normal) -> Ok(Nil)
+    Ok(reason) -> Error(WorkerExited(reason))
+    Error(Nil) -> Error(ShutdownTimedOut)
+  }
+}
+
 /// Create a child spec for adding to a static_supervisor.
-pub fn child_spec(
-  _name: String,
-  config: Config,
-) -> supervision.ChildSpecification(Worker) {
+pub fn child_spec(config: Config) -> supervision.ChildSpecification(Worker) {
   supervision.worker(fn() { start(config) })
 }
 
@@ -216,16 +320,15 @@ pub fn child_spec(
 /// Each worker gets a unique worker_id incorporating a unique integer
 /// to avoid collisions between pools.
 pub fn pool_child_specs(
-  name: String,
-  config: Config,
-  count: Int,
+  name name: String,
+  config config: Config,
+  count count: Int,
 ) -> List(supervision.ChildSpecification(Worker)) {
-  let unique = client.unique_integer()
-  list.index_fold(list.repeat(Nil, count), [], fn(acc, _, i) {
-    let i = i + 1
-    let wid = name <> "_" <> int.to_string(unique) <> "_" <> int.to_string(i)
-    let config = Config(..config, worker_id: wid)
-    [supervision.worker(fn() { start(config) }), ..acc]
+  let prefix = name <> "_" <> int.to_string(client.unique_integer()) <> "_"
+  int.range(from: 1, to: int.max(0, count) + 1, with: [], run: fn(specs, index) {
+    // Prepend each spec to keep the highest worker index first.
+    let worker_id = prefix <> int.to_string(index)
+    [child_spec(Config(..config, worker_id:)), ..specs]
   })
 }
 
@@ -237,46 +340,216 @@ fn handle_message(
   state: WorkerState,
   message: Message,
 ) -> actor.Next(WorkerState, Message) {
-  case message {
-    Poll -> {
-      let result =
-        task.claim(
-          state.config.db,
-          state.config.queue_name,
-          state.config.worker_id,
-          state.config.claim_timeout,
-          state.config.batch_size,
-        )
+  case message, state.stopping {
+    Poll, _ -> handle_poll(state) |> actor.continue
+    CheckLeases(delay), _ -> handle_lease_check(state, delay) |> actor.continue
+    Shutdown, option.None ->
+      finish_or_wait(
+        WorkerState(..state, stopping: option.Some(process.Normal)),
+      )
+    Shutdown, option.Some(_) -> actor.continue(state)
+    LinkedExit(exit), _ -> handle_exit(state, exit)
+  }
+}
 
-      case result {
-        Ok(claims) -> {
-          let state = WorkerState(..state, consecutive_errors: 0)
+fn handle_poll(state: WorkerState) -> WorkerState {
+  let cleared = WorkerState(..state, poll_pending: False)
+  case state.stopping, state.poll_pending, free_slots(state) {
+    option.None, True, slots if slots > 0 ->
+      poll(cleared, slots) |> schedule_poll(Delayed)
+    _, _, _ -> cleared
+  }
+}
 
-          list.each(claims, fn(claim) { execute_task(state, claim) })
-
-          // Schedule next poll
-          let _ =
-            process.send_after(state.subject, state.config.poll_interval, Poll)
-          actor.continue(state)
-        }
-
-        Error(error) -> {
-          let errors = state.consecutive_errors + 1
-          let state = WorkerState(..state, consecutive_errors: errors)
-          // Exponential backoff: min(poll_interval * 2^errors, max_backoff)
-          let backoff =
-            int.min(
-              exponential_backoff(state.config.poll_interval, errors),
-              state.config.max_backoff,
+fn schedule_poll(state: WorkerState, timing: PollTiming) -> WorkerState {
+  case state.stopping, state.poll_pending, free_slots(state) {
+    option.None, False, slots if slots > 0 -> {
+      case timing {
+        Immediate -> process.send(state.subject, Poll)
+        Delayed -> {
+          let _timer =
+            process.send_after(
+              state.subject,
+              state.retry_delay.milliseconds,
+              Poll,
             )
-          log_error("claim error", error)
-          let _ = process.send_after(state.subject, backoff, Poll)
-          actor.continue(state)
+          Nil
         }
       }
+      WorkerState(..state, poll_pending: True)
     }
+    _, _, _ -> state
+  }
+}
 
-    Shutdown -> actor.stop()
+fn free_slots(state: WorkerState) -> Int {
+  int.max(1, state.config.batch_size) - dict.size(state.active)
+}
+
+// A pending lease check must not delay a claim poll when a slot opens.
+fn schedule_lease_check(state: WorkerState, delay: DelayMs) -> WorkerState {
+  let should_check =
+    state.config.claim_expiry != lease.NoExpiry
+    && list.any(dict.values(state.active), fn(claim) { !claim.timed_out })
+  case state.lease_check_pending, should_check {
+    False, True -> {
+      let _timer =
+        process.send_after(
+          state.subject,
+          delay.milliseconds,
+          CheckLeases(delay),
+        )
+      WorkerState(..state, lease_check_pending: True)
+    }
+    _, _ -> state
+  }
+}
+
+fn handle_lease_check(state: WorkerState, delay: DelayMs) -> WorkerState {
+  let cleared = WorkerState(..state, lease_check_pending: False)
+  case check_leases(cleared) {
+    Ok(checked) -> schedule_lease_check(checked, state.config.poll_interval)
+    Error(error) -> {
+      log_error("check leases", error)
+      schedule_lease_check(cleared, backoff_delay(state.config, delay))
+    }
+  }
+}
+
+fn check_leases(state: WorkerState) -> Result(WorkerState, GabsurdError) {
+  let config = state.config
+  let claims =
+    dict.values(state.active)
+    |> list.filter_map(fn(claim) {
+      case claim {
+        ActiveClaim(task.RunId(run_id), owner, False) -> Ok(#(run_id, owner))
+        ActiveClaim(_, _, True) -> Error(Nil)
+      }
+    })
+  case claims {
+    [] -> Ok(state)
+    _ -> {
+      let #(run_ids, owners) = list.unzip(claims)
+      use expired <- result.map(
+        sql.expired_claims(
+          client.connection(config.db),
+          config.queue_name,
+          run_ids,
+          owners,
+        )
+        |> query.many,
+      )
+      case expired {
+        [] -> state
+        _ -> stop_expired_handlers(state, expired)
+      }
+    }
+  }
+}
+
+fn stop_expired_handlers(
+  state: WorkerState,
+  expired: List(sql.ExpiredClaimsRow),
+) -> WorkerState {
+  let expired =
+    expired
+    |> list.map(fn(row) { #(task.RunId(row.run_id), row.claim_owner) })
+    |> set.from_list
+  let active =
+    dict.map_values(state.active, fn(pid, claim) {
+      case
+        !claim.timed_out && set.contains(expired, #(claim.run_id, claim.owner))
+      {
+        True -> {
+          process.kill(pid)
+          // Keep the slot in use until the worker receives the exit.
+          ActiveClaim(..claim, timed_out: True)
+        }
+        False -> claim
+      }
+    })
+  WorkerState(..state, active:)
+}
+
+fn poll(state: WorkerState, slots: Int) -> WorkerState {
+  let config = state.config
+  let handler_map = state.handler_map
+  // The run ID can stay the same across claims. The owner ID must change.
+  let owner = config.worker_id <> "/" <> uuid.v4_string()
+  case
+    task.claim(config.db, config.queue_name, owner, config.claim_expiry, slots)
+  {
+    Ok(claims) -> {
+      let active =
+        list.fold(claims, state.active, fn(active, claim) {
+          let active_claim = ActiveClaim(claim.run_id, owner, timed_out: False)
+          let pid = spawn_task(config:, handler_map:, claim:, active_claim:)
+          dict.insert(active, pid, active_claim)
+        })
+      WorkerState(..state, active:, retry_delay: config.poll_interval)
+      |> schedule_lease_check(config.poll_interval)
+    }
+    Error(error) -> {
+      log_error("claim", error)
+      WorkerState(
+        ..state,
+        retry_delay: backoff_delay(config, state.retry_delay),
+      )
+    }
+  }
+}
+
+fn backoff_delay(config: Config, previous_delay: DelayMs) -> DelayMs {
+  DelayMs(int.min(
+    previous_delay.milliseconds * 2,
+    config.max_backoff.milliseconds,
+  ))
+}
+
+fn handle_exit(
+  state: WorkerState,
+  exit: process.ExitMessage,
+) -> actor.Next(WorkerState, Message) {
+  case dict.get(state.active, exit.pid) {
+    Ok(claim) -> {
+      case exit.reason, claim.timed_out {
+        process.Normal, _ | _, True -> Nil
+        _, False -> record_handler_crash(state.config, claim)
+      }
+      WorkerState(..state, active: dict.delete(state.active, exit.pid))
+      |> schedule_poll(Immediate)
+      |> finish_or_wait
+    }
+    Error(Nil) if exit.pid == state.parent || exit.reason != process.Normal ->
+      finish_or_wait(WorkerState(..state, stopping: option.Some(exit.reason)))
+    Error(Nil) -> actor.continue(state)
+  }
+}
+
+fn record_handler_crash(config: Config, claim: ActiveClaim) -> Nil {
+  let reason =
+    json.object([
+      #("name", json.string("$HandlerCrash")),
+      #("message", json.string("Task process exited before finishing")),
+    ])
+  fail_claim(config:, claim:, reason:)
+  |> handle_run_result("record handler crash", _)
+}
+
+fn finish_or_wait(state: WorkerState) -> actor.Next(WorkerState, Message) {
+  case dict.is_empty(state.active), state.stopping {
+    True, option.Some(process.Normal) -> actor.stop()
+    True, option.Some(process.Abnormal(reason)) -> {
+      // Preserve the exit reason, for example OTP's shutdown signal.
+      process.trap_exits(False)
+      process.send_abnormal_exit(process.self(), reason)
+      actor.stop()
+    }
+    True, option.Some(process.Killed) -> {
+      process.kill(process.self())
+      actor.stop()
+    }
+    _, _ -> actor.continue(state)
   }
 }
 
@@ -284,133 +557,149 @@ fn handle_message(
 // Task Execution
 // ============================================================================
 
-fn execute_task(state: WorkerState, claim: task.Claim) -> Nil {
-  case dict.get(state.handler_map, claim.task_name) {
-    Ok(handler) -> {
-      let ctx =
-        context.Context(
-          db: state.config.db,
-          queue_name: state.config.queue_name,
-          claim: claim,
-          claim_timeout: state.config.claim_timeout,
-        )
-      case handler.execute(ctx) {
-        Complete(result_json) -> {
-          case
-            task.complete(
-              state.config.db,
-              state.config.queue_name,
-              claim.run_id,
-              result_json,
-            )
-          {
-            Ok(_) -> Nil
-            Error(error) -> handle_completion_error("complete", error)
-          }
-        }
-        Fail(error_json) -> {
-          // Call on_error hook if present
-          case handler.on_error {
-            option.Some(hook) -> hook(ctx, error_json)
-            option.None -> Nil
-          }
-          case
-            task.fail(
-              state.config.db,
-              state.config.queue_name,
-              claim.run_id,
-              error_json,
-            )
-          {
-            Ok(_) -> Nil
-            Error(error) -> handle_completion_error("fail", error)
-          }
-        }
-        Suspend -> {
-          // The handler has called event.await, which put the run into
-          // sleeping state. Do NOT call complete or fail — the task will
-          // wake up when emit_event fires.
-          Nil
-        }
+fn spawn_task(
+  config config: Config,
+  handler_map handler_map: dict.Dict(String, Handler),
+  claim claim: task.Claim,
+  active_claim active_claim: ActiveClaim,
+) -> process.Pid {
+  let worker_pid = process.self()
+  process.spawn(fn() {
+    let task_pid = process.self()
+    // Start the watcher before the handler can trap linked exits.
+    let _watcher =
+      process.spawn_unlinked(fn() { watch_task(worker_pid, task_pid) })
+    execute_task(config:, handler_map:, claim:, active_claim:)
+  })
+}
+
+fn watch_task(worker_pid: process.Pid, task_pid: process.Pid) -> Nil {
+  let worker_monitor = process.monitor(worker_pid)
+  let task_monitor = process.monitor(task_pid)
+  process.new_selector()
+  |> process.select_specific_monitor(worker_monitor, fn(_) {
+    process.kill(task_pid)
+  })
+  |> process.select_specific_monitor(task_monitor, fn(_) { Nil })
+  |> process.selector_receive_forever
+}
+
+fn execute_task(
+  config config: Config,
+  handler_map handler_map: dict.Dict(String, Handler),
+  claim claim: task.Claim,
+  active_claim active_claim: ActiveClaim,
+) -> Nil {
+  case dict.get(handler_map, claim.task_name) {
+    Ok(handler) -> execute_handler(config:, claim:, active_claim:, handler:)
+    Error(Nil) -> {
+      // Defer unknown tasks until a worker with the new handler can claim them.
+      case defer_claim(config:, claim: active_claim) {
+        Ok(Nil) ->
+          io.println_error(
+            "gabsurd worker: deferred unknown task \""
+            <> claim.task_name
+            <> "\" (no handler registered)",
+          )
+        outcome -> handle_run_result("defer unknown task", outcome)
       }
     }
-    Error(_) -> {
-      // No handler for this task — defer it to support rolling deployments.
-      // This matches the official Absurd SDK behaviour: unknown tasks are
-      // rescheduled with a delay rather than permanently failed, so that a
-      // worker with the correct handler can pick it up after a deploy.
-      let _ =
-        task.schedule_run(
-          state.config.db,
-          state.config.queue_name,
-          claim.run_id,
-          60,
-        )
-      io.println_error(
-        "gabsurd worker: deferred unknown task \""
-        <> claim.task_name
-        <> "\" (no handler registered)",
-      )
-    }
   }
 }
 
-/// Handle errors from complete/fail calls.
-///
-/// The Absurd schema raises SQLSTATE AB001 (cancelled) and AB002 (already
-/// failed) when you try to complete or fail a run that is already in a
-/// terminal state. The official SDKs silently swallow these errors. We
-/// log unexpected errors but silently ignore terminal-state conflicts.
-fn handle_completion_error(context: String, error: GabsurdError) -> Nil {
-  case error {
-    // AB001 / AB002 — run is already in a terminal state (cancelled or
-    // failed). This can happen if the claim expired and another worker
-    // already handled it. Silently ignore, matching official SDK behaviour.
-    QueryError(reason) if reason == "AB002" -> Nil
-    QueryError(reason) -> {
-      // AB001 or other SQLSTATE errors — log but don't crash
-      case string_starts_with(reason, "AB0") {
-        True -> Nil
-        False -> log_error(context, error)
+fn defer_claim(
+  config config: Config,
+  claim claim: ActiveClaim,
+) -> Result(Nil, GabsurdError) {
+  let task.RunId(run_uuid) = claim.run_id
+  sql.schedule_run_if_claimed(
+    client.connection(config.db),
+    config.queue_name,
+    run_uuid,
+    claim.owner,
+    60,
+  )
+  |> query.claim_write(fn(row) { row.scheduled })
+}
+
+fn execute_handler(
+  config config: Config,
+  claim claim: task.Claim,
+  active_claim active_claim: ActiveClaim,
+  handler handler: Handler,
+) -> Nil {
+  let Config(db:, queue_name:, claim_expiry:, ..) = config
+  let ctx =
+    context.Context(
+      db:,
+      queue_name:,
+      claim:,
+      claim_owner: active_claim.owner,
+      claim_expiry:,
+    )
+  case handler.execute(ctx) {
+    Complete(result_json) ->
+      complete_claim(config:, claim: active_claim, state: result_json)
+      |> handle_run_result("complete", _)
+    Fail(error_json) -> {
+      case handler.on_error {
+        option.Some(hook) -> hook(ctx, error_json)
+        option.None -> Nil
       }
+      fail_claim(config:, claim: active_claim, reason: error_json)
+      |> handle_run_result("fail", _)
     }
-    _ -> log_error(context, error)
+    Suspend | Cancelled -> Nil
   }
 }
 
-fn string_starts_with(haystack: String, prefix: String) -> Bool {
-  let hay_len = string.length(haystack)
-  let pre_len = string.length(prefix)
-  case hay_len < pre_len {
-    True -> False
-    False -> {
-      let prefix_slice = string.slice(haystack, 0, pre_len)
-      prefix_slice == prefix
-    }
+fn complete_claim(
+  config config: Config,
+  claim claim: ActiveClaim,
+  state state: json.Json,
+) -> Result(Nil, GabsurdError) {
+  let task.RunId(run_uuid) = claim.run_id
+  sql.complete_run_if_claimed(
+    client.connection(config.db),
+    config.queue_name,
+    run_uuid,
+    claim.owner,
+    state,
+  )
+  |> query.claim_write(fn(row) { row.completed })
+}
+
+fn fail_claim(
+  config config: Config,
+  claim claim: ActiveClaim,
+  reason reason: json.Json,
+) -> Result(Nil, GabsurdError) {
+  let task.RunId(run_uuid) = claim.run_id
+  sql.fail_run_if_claimed(
+    client.connection(config.db),
+    config.queue_name,
+    run_uuid,
+    claim.owner,
+    reason,
+  )
+  |> query.claim_write(fn(row) { row.failed })
+}
+
+fn handle_run_result(
+  action: String,
+  outcome: Result(Nil, GabsurdError),
+) -> Nil {
+  case outcome {
+    Ok(Nil)
+    | Error(ClaimLost)
+    | Error(TaskCancelled)
+    | Error(RunAlreadyFailed(_)) -> Nil
+    Error(error) -> log_error(action, error)
   }
 }
 
-/// Calculate exponential backoff: base * 2^errors.
-fn exponential_backoff(base: Int, errors: Int) -> Int {
-  case errors {
-    0 -> base
-    _ -> base * power_of_2(errors)
-  }
-}
-
-fn power_of_2(n: Int) -> Int {
-  case n {
-    0 -> 1
-    _ -> 2 * power_of_2(n - 1)
-  }
-}
-
-fn log_error(context: String, error: GabsurdError) -> Nil {
-  let msg = case error {
-    QueryError(reason) -> context <> ": query error: " <> reason
-    UnexpectedRowCount(reason) -> context <> ": " <> reason
-    NotFound -> context <> ": not found"
-    ConnectionError(reason) -> context <> ": connection error: " <> reason
-  }
-  io.println_error("gabsurd worker: " <> msg)
+fn log_error(action: String, error: GabsurdError) -> Nil {
+  io.println_error(
+    "gabsurd worker: " <> action <> ": " <> client.error_message(error),
+  )
 }

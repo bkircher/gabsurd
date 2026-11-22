@@ -3,11 +3,13 @@
 import gabsurd/client
 import gabsurd/queue
 import gabsurd/test_support
+import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/list
 import gleeunit/should
+import pog
 
-pub fn create_queue_test() {
+pub fn create_queue_test() -> Nil {
   let assert Ok(started) = client.start(test_support.database_url())
   let db = started.data
 
@@ -20,7 +22,7 @@ pub fn create_queue_test() {
   process.send_exit(db.pid)
 }
 
-pub fn drop_queue_test() {
+pub fn drop_queue_test() -> Nil {
   let assert Ok(started) = client.start(test_support.database_url())
   let db = started.data
 
@@ -32,7 +34,7 @@ pub fn drop_queue_test() {
   process.send_exit(db.pid)
 }
 
-pub fn list_queues_test() {
+pub fn list_queues_test() -> Nil {
   let assert Ok(started) = client.start(test_support.database_url())
   let db = started.data
 
@@ -48,16 +50,31 @@ pub fn list_queues_test() {
   process.send_exit(db.pid)
 }
 
-pub fn create_queue_with_mode_test() {
-  let assert Ok(started) = client.start(test_support.database_url())
-  let db = started.data
+pub fn create_partitioned_queue_test() -> Nil {
+  use db <- test_support.with_transaction
+  let name = "test_partitioned"
 
-  queue.create_with_mode(db, "test_partitioned", "partitioned")
-  |> should.be_ok
+  let outcome = queue.create_with_mode(db, name, queue.Partitioned)
 
-  let assert Ok(queues) = queue.list(db)
-  queues |> list.contains("test_partitioned") |> should.be_true
+  outcome |> should.equal(Ok(Nil))
+  storage_mode(db, name) |> should.equal("partitioned")
+}
 
-  let _ = queue.drop(db, "test_partitioned")
-  process.send_exit(db.pid)
+pub fn create_unpartitioned_queue_with_mode_test() -> Nil {
+  use db <- test_support.with_transaction
+  let name = "test_unpartitioned"
+
+  let outcome = queue.create_with_mode(db, name, queue.Unpartitioned)
+
+  outcome |> should.equal(Ok(Nil))
+  storage_mode(db, name) |> should.equal("unpartitioned")
+}
+
+fn storage_mode(db: client.Db, name: String) -> String {
+  let assert Ok(pog.Returned(1, [mode])) =
+    pog.query("SELECT storage_mode FROM absurd.get_queue_policy($1)")
+    |> pog.parameter(pog.text(name))
+    |> pog.returning(decode.field(0, decode.string, decode.success))
+    |> pog.execute(client.connection(db))
+  mode
 }

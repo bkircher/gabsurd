@@ -1,15 +1,15 @@
 //// Converts generated query results to SDK results.
 
 import gabsurd/client.{
-  type GabsurdError, ConnectionError, NotFound, QueryError, UnexpectedRowCount,
+  type GabsurdError, ClaimLost, ConnectionError, ConstraintViolated, NotFound,
+  PostgresqlError, QueryError, RunAlreadyFailed, TaskCancelled,
+  UnexpectedRowCount,
 }
-import gleam/bit_array
 import gleam/int
 import gleam/list
 import gleam/result
 import gleam/string
 import pog
-import youid/uuid
 
 pub fn one(
   returned: Result(pog.Returned(a), pog.QueryError),
@@ -37,22 +37,25 @@ pub fn exec(
   returned |> result.replace(Nil) |> result.map_error(from_pog_error)
 }
 
-pub fn uuid_from_bits(bits: BitArray) -> Result(uuid.Uuid, GabsurdError) {
-  let error = QueryError("invalid UUID")
-  case bits {
-    <<_:128>> ->
-      uuid.from_bit_array(bits)
-      // PostgreSQL also accepts UUIDs without a version, such as the nil UUID.
-      |> result.lazy_or(fn() { uuid.from_string(bit_array.base16_encode(bits)) })
-      |> result.replace_error(error)
-    _ -> Error(error)
+pub fn claim_write(
+  returned: Result(pog.Returned(a), pog.QueryError),
+  written: fn(a) -> Bool,
+) -> Result(Nil, GabsurdError) {
+  use row <- result.try(one(returned))
+  case written(row) {
+    True -> Ok(Nil)
+    False -> Error(ClaimLost)
   }
 }
 
 fn from_pog_error(error: pog.QueryError) -> GabsurdError {
   case error {
-    pog.ConstraintViolated(message, _, _) -> QueryError(message)
-    pog.PostgresqlError(code, _, message) -> QueryError(code <> ": " <> message)
+    pog.ConstraintViolated(message:, constraint:, detail:) ->
+      ConstraintViolated(message:, constraint:, detail:)
+    pog.PostgresqlError("AB001", _, _) -> TaskCancelled
+    pog.PostgresqlError("AB002", _, message) -> RunAlreadyFailed(message)
+    pog.PostgresqlError(code:, name:, message:) ->
+      PostgresqlError(sqlstate: code, name:, message:)
     pog.UnexpectedArgumentCount(expected, got) ->
       QueryError(
         "unexpected argument count: expected "

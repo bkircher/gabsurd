@@ -1,2 +1,2 @@
--- Interpret the encoded timestamp as UTC, not as session-local time.
-SELECT absurd.schedule_run($1, $2, $3::timestamp AT TIME ZONE 'UTC')::text AS ignored;
+-- Schedule a run relative to the database clock.
+SELECT absurd.schedule_run($1, $2, absurd.current_time() + make_interval(secs => $3::bigint))::text AS ignored;

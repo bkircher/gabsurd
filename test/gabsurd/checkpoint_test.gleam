@@ -2,33 +2,23 @@
 
 import gabsurd/checkpoint
 import gabsurd/client
-import gabsurd/queue
+import gabsurd/lease
 import gabsurd/task
 import gabsurd/test_support
-import gleam/erlang/process
 import gleam/json
 import gleam/list
 import gleam/option
 import gleeunit/should
+import pog
+import youid/uuid
 
-fn setup(queue_name: String) -> #(client.Db, String) {
-  let assert Ok(started) = client.start(test_support.database_url())
-  let db = started.data
-  let assert Ok(Nil) = queue.create(db, queue_name)
-  #(db, queue_name)
-}
-
-fn teardown(db: client.Db, queue_name: String) {
-  let _ = queue.drop(db, queue_name)
-  process.send_exit(db.pid)
-}
-
-pub fn set_checkpoint_test() {
-  let #(db, q) = setup("test_checkpoint_set")
+pub fn set_checkpoint_test() -> Nil {
+  use db, q <- test_support.with_transaction_queue("test_checkpoint_set")
 
   let assert Ok(spawned) =
     task.spawn(db, q, "checkpoint_task", json.object([]), task.new_options())
-  let assert Ok(claims) = task.claim(db, q, "cp-worker", 30, 1)
+  let assert Ok(claims) =
+    task.claim(db, q, "cp-worker", lease.default_expiry, 1)
   let assert Ok(claim) = list.first(claims)
 
   // Set a checkpoint (extend_claim_by=0 for this test)
@@ -42,16 +32,30 @@ pub fn set_checkpoint_test() {
     0,
   )
   |> should.be_ok
-
-  teardown(db, q)
 }
 
-pub fn get_checkpoint_test() {
-  let #(db, q) = setup("test_checkpoint_get")
+pub fn set_checkpoint_rejects_a_run_from_another_task_test() -> Nil {
+  use db, q <- test_support.with_transaction_queue("test_checkpoint_wrong_task")
+  let assert Ok(_) =
+    task.spawn(db, q, "run_task", json.null(), task.new_options())
+  let assert Ok([claim]) = task.claim(db, q, "worker", lease.default_expiry, 1)
+  let assert Ok(other) =
+    task.spawn(db, q, "other_task", json.null(), task.new_options())
+
+  let outcome =
+    checkpoint.set(db, q, other.task_id, "step", json.int(42), claim.run_id, 60)
+
+  let assert Error(client.PostgresqlError(sqlstate: "P0001", ..)) = outcome
+  Nil
+}
+
+pub fn get_checkpoint_test() -> Nil {
+  use db, q <- test_support.with_transaction_queue("test_checkpoint_get")
 
   let assert Ok(spawned) =
     task.spawn(db, q, "cp_get_task", json.object([]), task.new_options())
-  let assert Ok(claims) = task.claim(db, q, "cp-get-worker", 30, 1)
+  let assert Ok(claims) =
+    task.claim(db, q, "cp-get-worker", lease.default_expiry, 1)
   let assert Ok(claim) = list.first(claims)
 
   // Set a checkpoint (extend_claim_by=0 for this test)
@@ -70,8 +74,27 @@ pub fn get_checkpoint_test() {
   let assert Ok(option.Some(cp)) =
     checkpoint.get(db, q, spawned.task_id, "step1", False)
   cp.checkpoint_name |> should.equal("step1")
-  cp.state |> should.equal("{\"progress\": 75}")
+  cp.state |> should.equal(option.Some("{\"progress\": 75}"))
   cp.status |> should.equal("committed")
+  cp.owner_run_id |> should.equal(option.Some(claim.run_id))
+}
 
-  teardown(db, q)
+pub fn checkpoint_retains_sql_null_state_and_owner_test() -> Nil {
+  use db, q <- test_support.with_transaction_queue("test_checkpoint_ownerless")
+  let assert Ok(spawned) =
+    task.spawn(db, q, "workflow", json.null(), task.new_options())
+  let task.TaskId(task_uuid) = spawned.task_id
+  let assert Ok(_) =
+    pog.query(
+      "INSERT INTO absurd.c_test_checkpoint_ownerless (task_id, checkpoint_name)
+       VALUES ($1, 'step')",
+    )
+    |> pog.parameter(pog.text(uuid.to_string(task_uuid)))
+    |> pog.execute(client.connection(db))
+
+  let outcome = checkpoint.get(db, q, spawned.task_id, "step", False)
+
+  let assert Ok(option.Some(cp)) = outcome
+  cp.state |> should.equal(option.None)
+  cp.owner_run_id |> should.equal(option.None)
 }

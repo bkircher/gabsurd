@@ -5,11 +5,12 @@
 import gabsurd/client.{type Db, type GabsurdError}
 import gabsurd/internal/query
 import gabsurd/internal/sql
+import gabsurd/lease.{type ClaimExpiry}
+import gleam/function
 import gleam/json
 import gleam/list
 import gleam/option
 import gleam/result
-import gleam/time/duration
 import gleam/time/timestamp
 import youid/uuid
 
@@ -17,39 +18,58 @@ import youid/uuid
 // Public Types
 // ============================================================================
 
-/// Information returned when spawning a task.
-pub type SpawnInfo {
-  SpawnInfo(task_id: BitArray, run_id: BitArray, attempt: Int, created: Bool)
+/// The UUID of a task. It stays the same across retries.
+pub type TaskId {
+  TaskId(uuid.Uuid)
 }
 
-/// Information returned when claiming a task.
+/// The UUID of one attempt to run a task.
+pub type RunId {
+  RunId(uuid.Uuid)
+}
+
+/// Information returned when spawning a task.
+pub type SpawnInfo {
+  SpawnInfo(task_id: TaskId, run_id: RunId, attempt: Int, created: Bool)
+}
+
+/// Information returned when claiming a task. SQL NULL is `None`.
 pub type Claim {
   Claim(
-    run_id: BitArray,
-    task_id: BitArray,
+    run_id: RunId,
+    task_id: TaskId,
     attempt: Int,
     task_name: String,
     params: String,
-    retry_strategy: String,
-    max_attempts: Int,
-    headers: String,
-    wake_event: String,
-    event_payload: String,
+    retry_strategy: option.Option(String),
+    /// `None` means this task has no attempt limit.
+    max_attempts: option.Option(Int),
+    headers: option.Option(String),
+    wake_event: option.Option(String),
+    event_payload: option.Option(String),
   )
 }
 
-/// Current state and result metadata for a task.
+/// Current state and routing metadata for a task.
+/// Optional JSON fields contain JSON text. SQL NULL is `None`, not `Some("null")`.
 pub type TaskResult {
-  TaskResult(
+  Pending(task_name: String, headers: option.Option(String))
+  Running(task_name: String, headers: option.Option(String))
+  Sleeping(task_name: String, headers: option.Option(String))
+  Completed(
     task_name: String,
-    headers: String,
-    state: String,
-    result: String,
-    failure_reason: String,
+    headers: option.Option(String),
+    result: option.Option(String),
   )
+  Failed(
+    task_name: String,
+    headers: option.Option(String),
+    failure_reason: option.Option(String),
+  )
+  Cancelled(task_name: String, headers: option.Option(String))
 }
 
-/// Options for spawning or retrying a task.
+/// Options for spawning a task.
 ///
 /// Create with `new_options()` and customize with `with_*` functions.
 ///
@@ -64,13 +84,23 @@ pub type TaskResult {
 /// ```
 pub type SpawnOptions {
   SpawnOptions(
-    max_attempts: option.Option(Int),
+    max_attempts: AttemptLimit,
     retry_strategy: option.Option(RetryStrategy),
     cancellation: option.Option(Cancellation),
     headers: option.Option(json.Json),
     idempotency_key: option.Option(String),
   )
 }
+
+/// Maximum total attempts for a new task, including its first attempt.
+pub type AttemptLimit {
+  /// Five attempts for a new task.
+  DefaultAttempts
+  LimitedAttempts(Int)
+  UnlimitedAttempts
+}
+
+const default_max_attempts = 5
 
 /// Retry strategy for failed tasks.
 pub type RetryStrategy {
@@ -92,14 +122,24 @@ pub type Cancellation {
   Cancellation(max_duration: Int)
 }
 
+/// Options for retrying a failed task in place.
+pub type RetryOptions {
+  RetryOptions(
+    /// A new total attempt limit. It must exceed the number of attempts already
+    /// made. With `None`, the database adds one to the previous limit, or to
+    /// the number of attempts already made if the task had no limit.
+    max_attempts: option.Option(Int),
+  )
+}
+
 // ============================================================================
 // Options Builders
 // ============================================================================
 
-/// Create empty spawn options (all fields default to absent).
+/// Create spawn options with a limit of five total attempts.
 pub fn new_options() -> SpawnOptions {
   SpawnOptions(
-    max_attempts: option.None,
+    max_attempts: DefaultAttempts,
     retry_strategy: option.None,
     cancellation: option.None,
     headers: option.None,
@@ -107,38 +147,56 @@ pub fn new_options() -> SpawnOptions {
   )
 }
 
-/// Set the maximum number of attempts for this task.
-pub fn with_max_attempts(options: SpawnOptions, max: Int) -> SpawnOptions {
-  SpawnOptions(..options, max_attempts: option.Some(max))
+/// Set the maximum total attempts for this task, including the first attempt.
+pub fn with_max_attempts(
+  options options: SpawnOptions,
+  max max: Int,
+) -> SpawnOptions {
+  SpawnOptions(..options, max_attempts: LimitedAttempts(max))
 }
 
+/// Spawn a task without an attempt limit.
+pub fn with_unlimited_attempts(options: SpawnOptions) -> SpawnOptions {
+  SpawnOptions(..options, max_attempts: UnlimitedAttempts)
+}
+
+// nolint: unused_exports -- public API for callers that set a retry policy
 /// Set the retry strategy for failed tasks.
 pub fn with_retry_strategy(
-  options: SpawnOptions,
-  strategy: RetryStrategy,
+  options options: SpawnOptions,
+  strategy strategy: RetryStrategy,
 ) -> SpawnOptions {
   SpawnOptions(..options, retry_strategy: option.Some(strategy))
 }
 
+// nolint: unused_exports -- public API for callers that set a cancellation policy
 /// Set the cancellation policy.
 pub fn with_cancellation(
-  options: SpawnOptions,
-  cancellation: Cancellation,
+  options options: SpawnOptions,
+  cancellation cancellation: Cancellation,
 ) -> SpawnOptions {
   SpawnOptions(..options, cancellation: option.Some(cancellation))
 }
 
 /// Set headers (arbitrary JSON metadata).
-pub fn with_headers(options: SpawnOptions, headers: json.Json) -> SpawnOptions {
+pub fn with_headers(
+  options options: SpawnOptions,
+  headers headers: json.Json,
+) -> SpawnOptions {
   SpawnOptions(..options, headers: option.Some(headers))
 }
 
 /// Set an idempotency key to prevent duplicate task creation.
 pub fn with_idempotency_key(
-  options: SpawnOptions,
-  key: String,
+  options options: SpawnOptions,
+  key key: String,
 ) -> SpawnOptions {
   SpawnOptions(..options, idempotency_key: option.Some(key))
+}
+
+/// Create retry options that add one attempt to the task's limit.
+pub fn new_retry_options() -> RetryOptions {
+  RetryOptions(max_attempts: option.None)
 }
 
 /// Encode spawn options to a JSON string for the database.
@@ -147,31 +205,37 @@ pub fn encode_options(options: SpawnOptions) -> String {
 }
 
 fn options_json(options: SpawnOptions) -> json.Json {
-  let entries = []
-  let entries = case options.max_attempts {
-    option.Some(max) -> [#("max_attempts", json.int(max)), ..entries]
+  let max_attempts = case options.max_attempts {
+    DefaultAttempts -> option.Some(default_max_attempts)
+    LimitedAttempts(max) -> option.Some(max)
+    UnlimitedAttempts -> option.None
+  }
+  attempt_entries(max_attempts)
+  |> optional_field(
+    "retry_strategy",
+    options.retry_strategy,
+    encode_retry_strategy,
+  )
+  |> optional_field("cancellation", options.cancellation, encode_cancellation)
+  |> optional_field("headers", options.headers, function.identity)
+  |> optional_field("idempotency_key", options.idempotency_key, json.string)
+  |> json.object
+}
+
+fn attempt_entries(limit: option.Option(Int)) -> List(#(String, json.Json)) {
+  optional_field([], "max_attempts", limit, json.int)
+}
+
+fn optional_field(
+  entries: List(#(String, json.Json)),
+  key: String,
+  value: option.Option(a),
+  encode: fn(a) -> json.Json,
+) -> List(#(String, json.Json)) {
+  case value {
+    option.Some(value) -> [#(key, encode(value)), ..entries]
     option.None -> entries
   }
-  let entries = case options.retry_strategy {
-    option.Some(strategy) -> [
-      #("retry_strategy", encode_retry_strategy(strategy)),
-      ..entries
-    ]
-    option.None -> entries
-  }
-  let entries = case options.cancellation {
-    option.Some(c) -> [#("cancellation", encode_cancellation(c)), ..entries]
-    option.None -> entries
-  }
-  let entries = case options.headers {
-    option.Some(h) -> [#("headers", h), ..entries]
-    option.None -> entries
-  }
-  let entries = case options.idempotency_key {
-    option.Some(key) -> [#("idempotency_key", json.string(key)), ..entries]
-    option.None -> entries
-  }
-  json.object(entries)
 }
 
 fn encode_retry_strategy(strategy: RetryStrategy) -> json.Json {
@@ -181,26 +245,20 @@ fn encode_retry_strategy(strategy: RetryStrategy) -> json.Json {
         #("kind", json.string("fixed")),
         #("base_seconds", json.int(base_seconds)),
       ])
-    ExponentialRetry(base_seconds, factor, max_seconds) -> {
-      let entries = [
+    ExponentialRetry(base_seconds, factor, max_seconds) ->
+      [
         #("kind", json.string("exponential")),
         #("base_seconds", json.int(base_seconds)),
         #("factor", json.float(factor)),
       ]
-      let entries = case max_seconds {
-        option.Some(max) -> [#("max_seconds", json.float(max)), ..entries]
-        option.None -> entries
-      }
-      json.object(entries)
-    }
+      |> optional_field("max_seconds", max_seconds, json.float)
+      |> json.object
   }
 }
 
 fn encode_cancellation(c: Cancellation) -> json.Json {
-  case c {
-    Cancellation(max_duration) ->
-      json.object([#("max_duration", json.int(max_duration))])
-  }
+  let Cancellation(max_duration) = c
+  json.object([#("max_duration", json.int(max_duration))])
 }
 
 // ============================================================================
@@ -225,202 +283,194 @@ fn encode_cancellation(c: Cancellation) -> json.Json {
 /// )
 /// ```
 pub fn spawn(
-  db: Db,
-  queue_name: String,
-  task_name: String,
-  params: json.Json,
-  options: SpawnOptions,
+  db db: Db,
+  queue_name queue_name: String,
+  task_name task_name: String,
+  params params: json.Json,
+  options options: SpawnOptions,
 ) -> Result(SpawnInfo, GabsurdError) {
-  use row <- result.try(
-    sql.spawn_task(
-      client.connection(db),
-      queue_name,
-      task_name,
-      params,
-      options_json(options),
-    )
-    |> query.one,
+  sql.spawn_task(
+    client.connection(db),
+    queue_name,
+    task_name,
+    params,
+    options_json(options),
   )
-  Ok(SpawnInfo(
-    task_id: uuid.to_bit_array(row.task_id),
-    run_id: uuid.to_bit_array(row.run_id),
-    attempt: row.attempt,
-    created: row.created,
-  ))
+  |> query.one
+  |> result.map(fn(row) {
+    SpawnInfo(
+      task_id: TaskId(row.task_id),
+      run_id: RunId(row.run_id),
+      attempt: row.attempt,
+      created: row.created,
+    )
+  })
 }
 
 /// Claim available tasks from a queue for a worker.
 pub fn claim(
-  db: Db,
-  queue_name: String,
-  worker_id: String,
-  claim_timeout: Int,
-  qty: Int,
+  db db: Db,
+  queue_name queue_name: String,
+  worker_id worker_id: String,
+  claim_expiry claim_expiry: ClaimExpiry,
+  qty qty: Int,
 ) -> Result(List(Claim), GabsurdError) {
-  use rows <- result.try(
-    sql.claim_task(
-      client.connection(db),
-      queue_name,
-      worker_id,
-      claim_timeout,
-      qty,
-    )
-    |> query.many,
+  sql.claim_task(
+    client.connection(db),
+    queue_name,
+    worker_id,
+    lease.to_sql_seconds(claim_expiry),
+    qty,
   )
-  Ok(
+  |> query.many
+  |> result.map(fn(rows) {
     list.map(rows, fn(row) {
       Claim(
-        run_id: uuid.to_bit_array(row.run_id),
-        task_id: uuid.to_bit_array(row.task_id),
+        run_id: RunId(row.run_id),
+        task_id: TaskId(row.task_id),
         attempt: row.attempt,
         task_name: row.task_name,
         params: row.params,
-        retry_strategy: option.unwrap(row.retry_strategy, "{}"),
-        max_attempts: option.unwrap(row.max_attempts, 0),
-        headers: option.unwrap(row.headers, "{}"),
-        wake_event: option.unwrap(row.wake_event, ""),
-        event_payload: option.unwrap(row.event_payload, "{}"),
+        retry_strategy: row.retry_strategy,
+        max_attempts: row.max_attempts,
+        headers: row.headers,
+        wake_event: row.wake_event,
+        event_payload: row.event_payload,
       )
-    }),
-  )
+    })
+  })
 }
 
-/// Mark a run as completed with optional result state.
+/// Mark a run as completed with a JSON result.
 pub fn complete(
-  db: Db,
-  queue_name: String,
-  run_id: BitArray,
-  state: json.Json,
+  db db: Db,
+  queue_name queue_name: String,
+  run_id run_id: RunId,
+  state state: json.Json,
 ) -> Result(Nil, GabsurdError) {
-  use run_id <- result.try(query.uuid_from_bits(run_id))
-  sql.complete_run(client.connection(db), queue_name, run_id, state)
+  let RunId(run_uuid) = run_id
+  sql.complete_run(client.connection(db), queue_name, run_uuid, state)
   |> query.exec
 }
 
 /// Mark a run as failed with a reason.
 /// Passes NULL for retry_at so the queue's retry policy controls retries.
 pub fn fail(
-  db: Db,
-  queue_name: String,
-  run_id: BitArray,
-  reason: json.Json,
+  db db: Db,
+  queue_name queue_name: String,
+  run_id run_id: RunId,
+  reason reason: json.Json,
 ) -> Result(Nil, GabsurdError) {
-  use run_id <- result.try(query.uuid_from_bits(run_id))
-  sql.fail_run(client.connection(db), queue_name, run_id, reason)
+  let RunId(run_uuid) = run_id
+  sql.fail_run(client.connection(db), queue_name, run_uuid, reason)
   |> query.exec
 }
 
+// nolint: unused_exports -- public API for callers that schedule a retry
 /// Mark a run as failed and schedule a retry at a specific time.
 pub fn fail_with_retry(
-  db: Db,
-  queue_name: String,
-  run_id: BitArray,
-  reason: json.Json,
-  retry_at: timestamp.Timestamp,
+  db db: Db,
+  queue_name queue_name: String,
+  run_id run_id: RunId,
+  reason reason: json.Json,
+  retry_at retry_at: timestamp.Timestamp,
 ) -> Result(Nil, GabsurdError) {
-  use run_id <- result.try(query.uuid_from_bits(run_id))
+  let RunId(run_uuid) = run_id
   sql.fail_run_with_retry(
     client.connection(db),
     queue_name,
-    run_id,
+    run_uuid,
     reason,
     retry_at,
   )
   |> query.exec
 }
 
+// nolint: unused_exports -- public API for callers that manage their own claims
 /// Extend a worker's claim lease on a run by `extend_by` seconds.
 ///
-/// This is the manual heartbeat mechanism. The primary lease extension
-/// mechanism is `checkpoint.set` which calls `set_task_checkpoint_state`
-/// with `extend_claim_by` — every checkpoint write extends the lease.
-///
-/// Use this function when you have long-running work between checkpoints
-/// and need to keep the lease alive.
+/// This function does not check the claim owner or expiry. In a worker
+/// handler, use `context.heartbeat` instead.
 pub fn extend_claim(
-  db: Db,
-  queue_name: String,
-  run_id: BitArray,
-  extend_by: Int,
+  db db: Db,
+  queue_name queue_name: String,
+  run_id run_id: RunId,
+  extend_by extend_by: Int,
 ) -> Result(Nil, GabsurdError) {
-  use run_id <- result.try(query.uuid_from_bits(run_id))
-  sql.extend_claim(client.connection(db), queue_name, run_id, extend_by)
+  let RunId(run_uuid) = run_id
+  sql.extend_claim(client.connection(db), queue_name, run_uuid, extend_by)
   |> query.exec
 }
 
-/// Schedule a run to become available again at a future time.
-/// Used for deferring unknown tasks during rolling deployments.
+/// Schedule a run to become available again in `defer_seconds` seconds,
+/// measured by the database clock.
 ///
-/// `defer_seconds` is how many seconds from now to reschedule.
+/// This function does not check the claim owner or expiry.
 pub fn schedule_run(
-  db: Db,
-  queue_name: String,
-  run_id: BitArray,
-  defer_seconds: Int,
+  db db: Db,
+  queue_name queue_name: String,
+  run_id run_id: RunId,
+  defer_seconds defer_seconds: Int,
 ) -> Result(Nil, GabsurdError) {
-  use run_id <- result.try(query.uuid_from_bits(run_id))
-  let now = timestamp.system_time()
-  let wake_at = timestamp.add(now, duration.seconds(defer_seconds))
-  sql.schedule_run(client.connection(db), queue_name, run_id, wake_at)
+  let RunId(run_uuid) = run_id
+  sql.schedule_run(client.connection(db), queue_name, run_uuid, defer_seconds)
   |> query.exec
 }
 
 /// Cancel a task by its task_id.
 pub fn cancel(
-  db: Db,
-  queue_name: String,
-  task_id: BitArray,
+  db db: Db,
+  queue_name queue_name: String,
+  task_id task_id: TaskId,
 ) -> Result(Nil, GabsurdError) {
-  use task_id <- result.try(query.uuid_from_bits(task_id))
-  sql.cancel_task(client.connection(db), queue_name, task_id) |> query.exec
+  let TaskId(task_uuid) = task_id
+  sql.cancel_task(client.connection(db), queue_name, task_uuid) |> query.exec
 }
 
-/// Get the current state and terminal payload of a task in any lifecycle state.
-///
-/// Works for tasks in any state: `pending`, `running`, `sleeping`, `completed`,
-/// `failed`, and `cancelled`. The `state` field always reflects the current
-/// lifecycle state. The `result` payload is populated only for completed tasks
-/// and `failure_reason` only for failed tasks; both are empty (`"{}"`) for
-/// non-terminal and cancelled states.
+/// Get the current state and routing metadata of a task.
+/// Only `Completed` can contain a result, and only `Failed` can contain a reason.
 pub fn get_result(
-  db: Db,
-  queue_name: String,
-  task_id: BitArray,
+  db db: Db,
+  queue_name queue_name: String,
+  task_id task_id: TaskId,
 ) -> Result(TaskResult, GabsurdError) {
-  use task_id <- result.try(query.uuid_from_bits(task_id))
+  let TaskId(task_uuid) = task_id
   use row <- result.try(
-    sql.get_task_result(client.connection(db), queue_name, task_id) |> query.one,
-  )
-  Ok(TaskResult(
-    task_name: row.task_name,
-    headers: row.headers,
-    state: row.state,
-    result: option.unwrap(row.result, "{}"),
-    failure_reason: option.unwrap(row.failure_reason, "{}"),
-  ))
-}
-
-/// Retry a task with typed options.
-pub fn retry(
-  db: Db,
-  queue_name: String,
-  task_id: BitArray,
-  options: SpawnOptions,
-) -> Result(SpawnInfo, GabsurdError) {
-  use task_id <- result.try(query.uuid_from_bits(task_id))
-  use row <- result.try(
-    sql.retry_task(
-      client.connection(db),
-      queue_name,
-      task_id,
-      options_json(options),
-    )
+    sql.get_task_result(client.connection(db), queue_name, task_uuid)
     |> query.one,
   )
-  Ok(SpawnInfo(
-    task_id: uuid.to_bit_array(row.task_id),
-    run_id: uuid.to_bit_array(row.run_id),
-    attempt: row.attempt,
-    created: row.created,
-  ))
+  let task_name = row.task_name
+  let headers = row.headers
+  case row.state {
+    "pending" -> Ok(Pending(task_name:, headers:))
+    "running" -> Ok(Running(task_name:, headers:))
+    "sleeping" -> Ok(Sleeping(task_name:, headers:))
+    "completed" -> Ok(Completed(task_name:, headers:, result: row.result))
+    "failed" ->
+      Ok(Failed(task_name:, headers:, failure_reason: row.failure_reason))
+    "cancelled" -> Ok(Cancelled(task_name:, headers:))
+    state -> Error(client.QueryError("unknown task state: " <> state))
+  }
+}
+
+/// Retry a failed task in place. Use `new_retry_options()` to add one attempt
+/// or set a new total limit with `RetryOptions(max_attempts: option.Some(n))`.
+pub fn retry(
+  db db: Db,
+  queue_name queue_name: String,
+  task_id task_id: TaskId,
+  options options: RetryOptions,
+) -> Result(SpawnInfo, GabsurdError) {
+  let TaskId(task_uuid) = task_id
+  let payload = json.object(attempt_entries(options.max_attempts))
+  sql.retry_task(client.connection(db), queue_name, task_uuid, payload)
+  |> query.one
+  |> result.map(fn(row) {
+    SpawnInfo(
+      task_id: TaskId(row.task_id),
+      run_id: RunId(row.run_id),
+      attempt: row.attempt,
+      created: row.created,
+    )
+  })
 }

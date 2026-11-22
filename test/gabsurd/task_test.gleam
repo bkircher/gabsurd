@@ -2,44 +2,29 @@
 
 import gabsurd/client
 import gabsurd/event
+import gabsurd/lease
 import gabsurd/queue
 import gabsurd/task
 import gabsurd/test_support
-import gleam/bit_array
-import gleam/erlang/process
+import gleam/dynamic/decode
 import gleam/json
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleeunit/should
+import pog
+import youid/uuid
 
-/// Helper: start a DB connection + create a queue, return both.
-fn setup(queue_name: String) -> #(client.Db, String) {
-  let assert Ok(started) = client.start(test_support.database_url())
-  let db = started.data
-  let assert Ok(Nil) = queue.create(db, queue_name)
-  #(db, queue_name)
-}
-
-/// Helper: cleanup queue + stop connection.
-fn teardown(db: client.Db, queue_name: String) {
-  let _ = queue.drop(db, queue_name)
-  process.send_exit(db.pid)
-}
-
-pub fn spawn_task_test() {
-  let #(db, q) = setup("test_spawn")
+pub fn spawn_task_test() -> Nil {
+  use db, q <- test_support.with_transaction_queue("test_spawn")
 
   let assert Ok(task_info) =
     task.spawn(db, q, "my_task", json.object([]), task.new_options())
   task_info.attempt |> should.equal(1)
   task_info.created |> should.be_true
-  should.be_true(bit_array.byte_size(task_info.task_id) == 16)
-  should.be_true(bit_array.byte_size(task_info.run_id) == 16)
-
-  teardown(db, q)
 }
 
-pub fn spawn_with_options_test() {
-  let #(db, q) = setup("test_spawn_opts")
+pub fn spawn_with_options_test() -> Nil {
+  use db, q <- test_support.with_transaction_queue("test_spawn_opts")
 
   let assert Ok(task_info) =
     task.spawn(
@@ -52,37 +37,94 @@ pub fn spawn_with_options_test() {
     )
   task_info.attempt |> should.equal(1)
   task_info.created |> should.be_true
-
-  teardown(db, q)
 }
 
-pub fn claim_task_test() {
-  let #(db, q) = setup("test_claim")
+pub fn claim_task_test() -> Nil {
+  use db, q <- test_support.with_transaction_queue("test_claim")
 
   let assert Ok(task_info) =
     task.spawn(db, q, "claimable_task", json.object([]), task.new_options())
-  let assert Ok(claims) = task.claim(db, q, "worker-1", 30, 1)
-  list.length(claims) |> should.equal(1)
+  let assert Ok([claim]) =
+    task.claim(db, q, "worker-1", lease.default_expiry, 1)
 
-  let assert Ok(claim) = list.first(claims)
   claim.task_name |> should.equal("claimable_task")
   claim.attempt |> should.equal(1)
+  claim.task_id |> should.equal(task_info.task_id)
   claim.run_id |> should.equal(task_info.run_id)
-  claim.retry_strategy |> should.equal("{}")
-  claim.max_attempts |> should.equal(0)
-  claim.headers |> should.equal("{}")
-  claim.wake_event |> should.equal("")
-  claim.event_payload |> should.equal("{}")
-
-  teardown(db, q)
+  claim.retry_strategy |> should.equal(None)
+  claim.max_attempts |> should.equal(Some(5))
+  claim.headers |> should.equal(None)
+  claim.wake_event |> should.equal(None)
+  claim.event_payload |> should.equal(None)
 }
 
-pub fn complete_run_test() {
-  let #(db, q) = setup("test_complete")
+pub fn default_spawn_options_encode_five_attempts_test() -> Nil {
+  let options = task.new_options()
+
+  let encoded = task.encode_options(options)
+
+  json.parse(encoded, max_attempts_decoder()) |> should.equal(Ok(Some(5)))
+}
+
+pub fn unlimited_spawn_options_encode_no_attempt_limit_test() -> Nil {
+  let options = task.new_options() |> task.with_unlimited_attempts()
+
+  let encoded = task.encode_options(options)
+
+  json.parse(encoded, max_attempts_decoder()) |> should.equal(Ok(None))
+}
+
+fn max_attempts_decoder() -> decode.Decoder(Option(Int)) {
+  use limit <- decode.optional_field(
+    "max_attempts",
+    None,
+    decode.map(decode.int, Some),
+  )
+  decode.success(limit)
+}
+
+pub fn default_retry_limit_stops_after_five_attempts_test() -> Nil {
+  use db, q <- test_support.with_transaction_queue("test_retry_limit")
+  let assert Ok(spawned) =
+    task.spawn(db, q, "always_fails", json.null(), task.new_options())
+
+  fail_next_attempt(db:, queue_name: q, attempt: 1)
+  fail_next_attempt(db:, queue_name: q, attempt: 2)
+  fail_next_attempt(db:, queue_name: q, attempt: 3)
+  fail_next_attempt(db:, queue_name: q, attempt: 4)
+  fail_next_attempt(db:, queue_name: q, attempt: 5)
+
+  let assert Ok(task.Failed(..)) = task.get_result(db, q, spawned.task_id)
+  task.claim(db, q, "worker", lease.default_expiry, 1) |> should.equal(Ok([]))
+}
+
+fn fail_next_attempt(
+  db db: client.Db,
+  queue_name q: String,
+  attempt attempt: Int,
+) -> Nil {
+  let assert Ok([claim]) = task.claim(db, q, "worker", lease.default_expiry, 1)
+  claim.attempt |> should.equal(attempt)
+  let assert Ok(Nil) = task.fail(db, q, claim.run_id, json.string("failure"))
+  Nil
+}
+
+pub fn explicit_unlimited_attempts_has_no_limit_test() -> Nil {
+  use db, q <- test_support.with_transaction_queue("test_retry_unlimited")
+  let options = task.new_options() |> task.with_unlimited_attempts()
+
+  let assert Ok(_) = task.spawn(db, q, "workflow", json.null(), options)
+  let assert Ok([claim]) = task.claim(db, q, "worker", lease.default_expiry, 1)
+
+  claim.max_attempts |> should.equal(None)
+}
+
+pub fn complete_run_test() -> Nil {
+  use db, q <- test_support.with_transaction_queue("test_complete")
 
   let assert Ok(_) =
     task.spawn(db, q, "completable_task", json.object([]), task.new_options())
-  let assert Ok(claims) = task.claim(db, q, "worker-2", 30, 1)
+  let assert Ok(claims) = task.claim(db, q, "worker-2", lease.default_expiry, 1)
   let assert Ok(claim) = list.first(claims)
 
   task.complete(
@@ -92,26 +134,40 @@ pub fn complete_run_test() {
     json.object([#("status", json.string("done"))]),
   )
   |> should.be_ok
-
-  teardown(db, q)
 }
 
-pub fn fail_run_test() {
-  let #(db, q) = setup("test_fail")
+pub fn fail_run_test() -> Nil {
+  use db, q <- test_support.with_transaction_queue("test_fail")
 
   let assert Ok(_) =
     task.spawn(db, q, "failing_task", json.object([]), task.new_options())
-  let assert Ok(claims) = task.claim(db, q, "worker-3", 30, 1)
+  let assert Ok(claims) = task.claim(db, q, "worker-3", lease.default_expiry, 1)
   let assert Ok(claim) = list.first(claims)
 
   task.fail(db, q, claim.run_id, json.object([#("error", json.string("boom"))]))
   |> should.be_ok
-
-  teardown(db, q)
 }
 
-pub fn retry_failed_task_test() {
-  let #(db, q) = setup("test_retry")
+pub fn schedule_run_uses_the_database_clock_test() -> Nil {
+  use db, q <- test_support.with_transaction_queue("task_schedule_db_time")
+  test_support.set_time(db, "2025-01-02T03:04:05Z")
+  let assert Ok(_) =
+    task.spawn(db, q, "workflow", json.null(), task.new_options())
+  let assert Ok([first]) = task.claim(db, q, "worker", lease.default_expiry, 1)
+
+  let outcome = task.schedule_run(db, q, first.run_id, 60)
+
+  outcome |> should.equal(Ok(Nil))
+  test_support.set_time(db, "2025-01-02T03:05:04Z")
+  task.claim(db, q, "worker", lease.default_expiry, 1) |> should.equal(Ok([]))
+  test_support.set_time(db, "2025-01-02T03:05:05Z")
+  let assert Ok([resumed]) =
+    task.claim(db, q, "worker", lease.default_expiry, 1)
+  resumed.run_id |> should.equal(first.run_id)
+}
+
+pub fn retry_failed_task_adds_one_attempt_by_default_test() -> Nil {
+  use db, q <- test_support.with_transaction_queue("test_retry")
   let assert Ok(spawned) =
     task.spawn(
       db,
@@ -120,41 +176,51 @@ pub fn retry_failed_task_test() {
       json.null(),
       task.new_options() |> task.with_max_attempts(1),
     )
-  let assert Ok([claim]) = task.claim(db, q, "worker", 30, 1)
-  let assert Ok(Nil) = task.fail(db, q, claim.run_id, json.string("failure"))
+  fail_next_attempt(db:, queue_name: q, attempt: 1)
 
-  let assert Ok(retry) = task.retry(db, q, spawned.task_id, task.new_options())
+  let assert Ok(retry) =
+    task.retry(db, q, spawned.task_id, task.new_retry_options())
+  let assert Ok([retried_claim]) =
+    task.claim(db, q, "worker", lease.default_expiry, 1)
 
   retry.task_id |> should.equal(spawned.task_id)
   retry.attempt |> should.equal(2)
   retry.created |> should.be_false
-
-  teardown(db, q)
+  retried_claim.task_id |> should.equal(retry.task_id)
+  retried_claim.run_id |> should.equal(retry.run_id)
+  retried_claim.max_attempts |> should.equal(Some(2))
 }
 
-pub fn cancel_task_test() {
-  let #(db, q) = setup("test_cancel")
+pub fn retry_failed_task_sets_explicit_attempt_limit_test() -> Nil {
+  use db, q <- test_support.with_transaction_queue("test_retry_explicit_limit")
+  let assert Ok(spawned) =
+    task.spawn(
+      db,
+      q,
+      "retry_task",
+      json.null(),
+      task.new_options() |> task.with_max_attempts(1),
+    )
+  fail_next_attempt(db:, queue_name: q, attempt: 1)
+  let options = task.RetryOptions(max_attempts: Some(4))
+
+  let assert Ok(_) = task.retry(db, q, spawned.task_id, options)
+  let assert Ok([claim]) = task.claim(db, q, "worker", lease.default_expiry, 1)
+
+  claim.max_attempts |> should.equal(Some(4))
+}
+
+pub fn cancel_task_test() -> Nil {
+  use db, q <- test_support.with_transaction_queue("test_cancel")
 
   let assert Ok(task_info) =
     task.spawn(db, q, "cancellable_task", json.object([]), task.new_options())
   task.cancel(db, q, task_info.task_id) |> should.be_ok
-
-  teardown(db, q)
 }
 
-/// Task reads expose routing metadata and every practical task state.
-pub fn cancel_task_rejects_partial_uuid_test() {
-  let #(db, q) = setup("test_cancel_partial_uuid")
-
-  let outcome = task.cancel(db, q, <<0:127>>)
-
-  outcome |> should.equal(Error(client.QueryError("invalid UUID")))
-
-  teardown(db, q)
-}
-
-pub fn task_result_states_test() {
-  let #(db, q) = setup("test_result_states")
+/// Task reads return routing metadata and a variant for each state.
+pub fn task_result_states_test() -> Nil {
+  use db, q <- test_support.with_transaction_queue("test_result_states")
   let headers = json.object([#("source", json.string("test"))])
 
   // pending
@@ -166,29 +232,29 @@ pub fn task_result_states_test() {
       json.object([]),
       task.new_options() |> task.with_headers(headers),
     )
-  let assert Ok(pending_result) = task.get_result(db, q, pending.task_id)
-  pending_result.task_name |> should.equal("pending_task")
-  pending_result.headers |> should.equal("{\"source\": \"test\"}")
-  pending_result.state |> should.equal("pending")
+  task.get_result(db, q, pending.task_id)
+  |> should.equal(
+    Ok(task.Pending("pending_task", Some("{\"source\": \"test\"}"))),
+  )
   let assert Ok(Nil) = task.cancel(db, q, pending.task_id)
 
   // running
   let assert Ok(running) =
     task.spawn(db, q, "running_task", json.object([]), task.new_options())
-  let assert Ok(running_claims) = task.claim(db, q, "state-worker", 30, 1)
+  let assert Ok(running_claims) =
+    task.claim(db, q, "state-worker", lease.default_expiry, 1)
   let assert Ok(running_claim) = list.first(running_claims)
   running_claim.task_id |> should.equal(running.task_id)
-  let assert Ok(running_result) = task.get_result(db, q, running.task_id)
-  running_result.task_name |> should.equal("running_task")
-  running_result.headers |> should.equal("{}")
-  running_result.state |> should.equal("running")
+  task.get_result(db, q, running.task_id)
+  |> should.equal(Ok(task.Running("running_task", None)))
   let assert Ok(Nil) =
     task.complete(db, q, running_claim.run_id, json.string("running-done"))
 
   // sleeping
   let assert Ok(sleeping) =
     task.spawn(db, q, "sleeping_task", json.object([]), task.new_options())
-  let assert Ok(sleeping_claims) = task.claim(db, q, "state-worker", 30, 1)
+  let assert Ok(sleeping_claims) =
+    task.claim(db, q, "state-worker", lease.default_expiry, 1)
   let assert Ok(sleeping_claim) = list.first(sleeping_claims)
   let assert Ok(awaited) =
     event.await(
@@ -198,26 +264,22 @@ pub fn task_result_states_test() {
       sleeping_claim.run_id,
       "state-step",
       "state-event",
-      1,
+      None,
     )
-  awaited.should_suspend |> should.be_true
-  let assert Ok(sleeping_result) = task.get_result(db, q, sleeping.task_id)
-  sleeping_result.task_name |> should.equal("sleeping_task")
-  sleeping_result.headers |> should.equal("{}")
-  sleeping_result.state |> should.equal("sleeping")
+  awaited |> should.equal(event.Suspended)
+  task.get_result(db, q, sleeping.task_id)
+  |> should.equal(Ok(task.Sleeping("sleeping_task", None)))
 
   // completed
   let assert Ok(completed) =
     task.spawn(db, q, "completed_task", json.object([]), task.new_options())
-  let assert Ok(completed_claims) = task.claim(db, q, "state-worker", 30, 1)
+  let assert Ok(completed_claims) =
+    task.claim(db, q, "state-worker", lease.default_expiry, 1)
   let assert Ok(completed_claim) = list.first(completed_claims)
   let assert Ok(Nil) =
     task.complete(db, q, completed_claim.run_id, json.string("done"))
-  let assert Ok(completed_result) = task.get_result(db, q, completed.task_id)
-  completed_result.task_name |> should.equal("completed_task")
-  completed_result.headers |> should.equal("{}")
-  completed_result.state |> should.equal("completed")
-  completed_result.result |> should.equal("\"done\"")
+  task.get_result(db, q, completed.task_id)
+  |> should.equal(Ok(task.Completed("completed_task", None, Some("\"done\""))))
 
   // failed
   let assert Ok(failed) =
@@ -228,38 +290,50 @@ pub fn task_result_states_test() {
       json.object([]),
       task.new_options() |> task.with_max_attempts(1),
     )
-  let assert Ok(failed_claims) = task.claim(db, q, "state-worker", 30, 1)
+  let assert Ok(failed_claims) =
+    task.claim(db, q, "state-worker", lease.default_expiry, 1)
   let assert Ok(failed_claim) = list.first(failed_claims)
   let assert Ok(Nil) =
     task.fail(db, q, failed_claim.run_id, json.string("boom"))
-  let assert Ok(failed_result) = task.get_result(db, q, failed.task_id)
-  failed_result.task_name |> should.equal("failed_task")
-  failed_result.headers |> should.equal("{}")
-  failed_result.state |> should.equal("failed")
-  failed_result.failure_reason |> should.equal("\"boom\"")
+  task.get_result(db, q, failed.task_id)
+  |> should.equal(Ok(task.Failed("failed_task", None, Some("\"boom\""))))
 
   // cancelled
   let assert Ok(cancelled) =
     task.spawn(db, q, "cancelled_task", json.object([]), task.new_options())
   let assert Ok(Nil) = task.cancel(db, q, cancelled.task_id)
-  let assert Ok(cancelled_result) = task.get_result(db, q, cancelled.task_id)
-  cancelled_result.task_name |> should.equal("cancelled_task")
-  cancelled_result.headers |> should.equal("{}")
-  cancelled_result.state |> should.equal("cancelled")
+  task.get_result(db, q, cancelled.task_id)
+  |> should.equal(Ok(task.Cancelled("cancelled_task", None)))
 
   // A task ID from another queue is not found.
   let missing_queue = "test_result_missing"
   let assert Ok(Nil) = queue.create(db, missing_queue)
   task.get_result(db, missing_queue, pending.task_id)
   |> should.equal(Error(client.NotFound))
-  task.get_result(db, missing_queue, <<0:128>>)
+  task.get_result(db, missing_queue, task.TaskId(uuid.nil))
   |> should.equal(Error(client.NotFound))
-  let _ = queue.drop(db, missing_queue)
-  teardown(db, q)
 }
 
-pub fn full_lifecycle_test() {
-  let #(db, q) = setup("test_lifecycle")
+pub fn completed_task_without_a_payload_has_no_result_test() -> Nil {
+  use db, q <- test_support.with_transaction_queue("test_result_no_payload")
+  let assert Ok(spawned) =
+    task.spawn(db, q, "workflow", json.null(), task.new_options())
+  let assert Ok([claim]) = task.claim(db, q, "worker", lease.default_expiry, 1)
+  let task.RunId(run_uuid) = claim.run_id
+  // Complete the run with SQL NULL rather than a JSON value.
+  let assert Ok(_) =
+    pog.query("SELECT absurd.complete_run($1, $2)::text")
+    |> pog.parameter(pog.text(q))
+    |> pog.parameter(pog.text(uuid.to_string(run_uuid)))
+    |> pog.execute(client.connection(db))
+
+  let outcome = task.get_result(db, q, spawned.task_id)
+
+  outcome |> should.equal(Ok(task.Completed("workflow", None, None)))
+}
+
+pub fn full_lifecycle_test() -> Nil {
+  use db, q <- test_support.with_transaction_queue("test_lifecycle")
 
   // 1. Spawn
   let assert Ok(spawned) =
@@ -273,7 +347,8 @@ pub fn full_lifecycle_test() {
   spawned.attempt |> should.equal(1)
 
   // 2. Claim
-  let assert Ok(claims) = task.claim(db, q, "lifecycle-worker", 30, 1)
+  let assert Ok(claims) =
+    task.claim(db, q, "lifecycle-worker", lease.default_expiry, 1)
   list.length(claims) |> should.equal(1)
   let assert Ok(claim) = list.first(claims)
   claim.task_name |> should.equal("lifecycle_task")
@@ -283,8 +358,7 @@ pub fn full_lifecycle_test() {
     task.complete(db, q, claim.run_id, json.object([#("output", json.int(99))]))
 
   // 4. Verify no more tasks to claim
-  let assert Ok(claims2) = task.claim(db, q, "lifecycle-worker", 30, 1)
+  let assert Ok(claims2) =
+    task.claim(db, q, "lifecycle-worker", lease.default_expiry, 1)
   list.length(claims2) |> should.equal(0)
-
-  teardown(db, q)
 }

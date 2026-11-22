@@ -13,46 +13,47 @@
 import gabsurd/client.{type Db, type GabsurdError, NotFound}
 import gabsurd/internal/query
 import gabsurd/internal/sql
+import gabsurd/task.{type RunId, type TaskId, RunId, TaskId}
 import gleam/json
 import gleam/option
-import gleam/result
 import gleam/time/timestamp.{type Timestamp}
-import youid/uuid
 
-/// A checkpoint record.
+/// A checkpoint record. SQL NULL state or owner is `None`.
 pub type Checkpoint {
   Checkpoint(
     checkpoint_name: String,
-    state: String,
+    state: option.Option(String),
     status: String,
-    owner_run_id: BitArray,
+    owner_run_id: option.Option(RunId),
     updated_at: Timestamp,
   )
 }
 
-/// Set a checkpoint for a task step.
+/// Set a checkpoint for a task step. The run must belong to the given task.
+///
+/// This function does not check the claim owner or expiry. In a worker
+/// handler, use `context.set_checkpoint` instead.
 ///
 /// `extend_claim_by` is the number of seconds to extend the worker's claim
-/// lease. Pass your worker's `claim_timeout` value here so that every
-/// checkpoint write keeps the lease alive. Pass `0` to skip extension.
+/// lease. Pass `0` to save the checkpoint without renewing the lease.
 pub fn set(
-  db: Db,
-  queue_name: String,
-  task_id: BitArray,
-  step_name: String,
-  state: json.Json,
-  owner_run_id: BitArray,
-  extend_claim_by: Int,
+  db db: Db,
+  queue_name queue_name: String,
+  task_id task_id: TaskId,
+  step_name step_name: String,
+  state state: json.Json,
+  owner_run_id owner_run_id: RunId,
+  extend_claim_by extend_claim_by: Int,
 ) -> Result(Nil, GabsurdError) {
-  use task_id <- result.try(query.uuid_from_bits(task_id))
-  use owner_run_id <- result.try(query.uuid_from_bits(owner_run_id))
+  let TaskId(task_uuid) = task_id
+  let RunId(owner_uuid) = owner_run_id
   sql.set_task_checkpoint_state(
     client.connection(db),
     queue_name,
-    task_id,
+    task_uuid,
     step_name,
     state,
-    owner_run_id,
+    owner_uuid,
     extend_claim_by,
   )
   |> query.exec
@@ -62,18 +63,18 @@ pub fn set(
 /// Returns `Ok(Some(checkpoint))` if found, `Ok(None)` if not found,
 /// or `Error(GabsurdError)` on database failure.
 pub fn get(
-  db: Db,
-  queue_name: String,
-  task_id: BitArray,
-  step_name: String,
-  include_pending: Bool,
+  db db: Db,
+  queue_name queue_name: String,
+  task_id task_id: TaskId,
+  step_name step_name: String,
+  include_pending include_pending: Bool,
 ) -> Result(option.Option(Checkpoint), GabsurdError) {
-  use task_id <- result.try(query.uuid_from_bits(task_id))
+  let TaskId(task_uuid) = task_id
   case
     sql.get_task_checkpoint_state(
       client.connection(db),
       queue_name,
-      task_id,
+      task_uuid,
       step_name,
       include_pending,
     )
@@ -83,11 +84,9 @@ pub fn get(
       Ok(
         option.Some(Checkpoint(
           checkpoint_name: row.checkpoint_name,
-          state: option.unwrap(row.state, "{}"),
+          state: row.state,
           status: row.status,
-          owner_run_id: row.owner_run_id
-            |> option.map(uuid.to_bit_array)
-            |> option.unwrap(<<0:128>>),
+          owner_run_id: option.map(row.owner_run_id, RunId),
           updated_at: row.updated_at,
         )),
       )

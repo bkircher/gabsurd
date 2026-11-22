@@ -8,7 +8,7 @@ import gleam/io
 import gleam/list
 import gleeunit/should
 
-pub fn integration_test() {
+pub fn integration_test() -> Nil {
   let assert Ok(started) = client.start(test_support.database_url())
   let db = started.data
 

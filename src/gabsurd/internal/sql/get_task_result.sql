@@ -1,7 +1,7 @@
 SELECT
   task_id,
   task_name,
-  headers,
+  headers AS "headers?",
   state,
   result AS "result?",
   failure_reason AS "failure_reason?"

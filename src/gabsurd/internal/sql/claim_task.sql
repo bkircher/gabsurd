@@ -10,4 +10,4 @@ SELECT
   headers AS "headers?",
   wake_event AS "wake_event?",
   event_payload AS "event_payload?"
-FROM absurd.claim_task($1, $2, $3, $4);
+FROM gabsurd.claim_task($1, $2, $3, $4);

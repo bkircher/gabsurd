@@ -43,12 +43,66 @@ pub fn await_event(
 
   "-- A timed wait. Keep SQL NULL distinct from the JSON value null.
 SELECT should_suspend, payload::text AS \"payload?\"
-FROM absurd.await_event($1, $2, $3, $4, $5, $6);
+FROM gabsurd.await_event($1, $2, $3, $4, $5, $6);
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
   |> pog.parameter(pog.text(uuid.to_string(arg_2)))
   |> pog.parameter(pog.text(uuid.to_string(arg_3)))
+  |> pog.parameter(pog.text(arg_4))
+  |> pog.parameter(pog.text(arg_5))
+  |> pog.parameter(pog.int(arg_6))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `await_event_if_claimed` query
+/// defined in `./src/gabsurd/internal/sql/await_event_if_claimed.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type AwaitEventIfClaimedRow {
+  AwaitEventIfClaimedRow(
+    claim_lost: Bool,
+    should_suspend: Bool,
+    payload: Option(String),
+  )
+}
+
+/// A timed event wait that checks the claim before a write.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn await_event_if_claimed(
+  db: pog.Connection,
+  arg_1: String,
+  arg_2: Uuid,
+  arg_3: String,
+  arg_4: String,
+  arg_5: String,
+  arg_6: Int,
+) -> Result(pog.Returned(AwaitEventIfClaimedRow), pog.QueryError) {
+  let decoder = {
+    use claim_lost <- decode.field(0, decode.bool)
+    use should_suspend <- decode.field(1, decode.bool)
+    use payload <- decode.field(2, decode.optional(decode.string))
+    decode.success(AwaitEventIfClaimedRow(
+      claim_lost:,
+      should_suspend:,
+      payload:,
+    ))
+  }
+
+  "-- A timed event wait that checks the claim before a write.
+SELECT claim_lost, should_suspend, payload::text AS \"payload?\"
+FROM gabsurd.await_event($1, NULL::uuid, $2, $4, $5, $6, $3);
+"
+  |> pog.query
+  |> pog.parameter(pog.text(arg_1))
+  |> pog.parameter(pog.text(uuid.to_string(arg_2)))
+  |> pog.parameter(pog.text(arg_3))
   |> pog.parameter(pog.text(arg_4))
   |> pog.parameter(pog.text(arg_5))
   |> pog.parameter(pog.int(arg_6))
@@ -87,12 +141,64 @@ pub fn await_event_unlimited(
 
   "-- An event wait with no deadline.
 SELECT should_suspend, payload::text AS \"payload?\"
-FROM absurd.await_event($1, $2, $3, $4, $5, NULL::integer);
+FROM gabsurd.await_event($1, $2, $3, $4, $5, NULL::integer);
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
   |> pog.parameter(pog.text(uuid.to_string(arg_2)))
   |> pog.parameter(pog.text(uuid.to_string(arg_3)))
+  |> pog.parameter(pog.text(arg_4))
+  |> pog.parameter(pog.text(arg_5))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `await_event_unlimited_if_claimed` query
+/// defined in `./src/gabsurd/internal/sql/await_event_unlimited_if_claimed.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type AwaitEventUnlimitedIfClaimedRow {
+  AwaitEventUnlimitedIfClaimedRow(
+    claim_lost: Bool,
+    should_suspend: Bool,
+    payload: Option(String),
+  )
+}
+
+/// An event wait with no deadline that checks the claim before a write.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn await_event_unlimited_if_claimed(
+  db: pog.Connection,
+  arg_1: String,
+  arg_2: Uuid,
+  arg_3: String,
+  arg_4: String,
+  arg_5: String,
+) -> Result(pog.Returned(AwaitEventUnlimitedIfClaimedRow), pog.QueryError) {
+  let decoder = {
+    use claim_lost <- decode.field(0, decode.bool)
+    use should_suspend <- decode.field(1, decode.bool)
+    use payload <- decode.field(2, decode.optional(decode.string))
+    decode.success(AwaitEventUnlimitedIfClaimedRow(
+      claim_lost:,
+      should_suspend:,
+      payload:,
+    ))
+  }
+
+  "-- An event wait with no deadline that checks the claim before a write.
+SELECT claim_lost, should_suspend, payload::text AS \"payload?\"
+FROM gabsurd.await_event($1, NULL::uuid, $2, $4, $5, NULL::integer, $3);
+"
+  |> pog.query
+  |> pog.parameter(pog.text(arg_1))
+  |> pog.parameter(pog.text(uuid.to_string(arg_2)))
+  |> pog.parameter(pog.text(arg_3))
   |> pog.parameter(pog.text(arg_4))
   |> pog.parameter(pog.text(arg_5))
   |> pog.returning(decoder)
@@ -204,7 +310,7 @@ SELECT
   headers AS \"headers?\",
   wake_event AS \"wake_event?\",
   event_payload AS \"event_payload?\"
-FROM absurd.claim_task($1, $2, $3, $4);
+FROM gabsurd.claim_task($1, $2, $3, $4);
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
@@ -259,80 +365,6 @@ FROM absurd.cleanup_all_queues($1);
   |> pog.execute(db)
 }
 
-/// A row you get from running the `cleanup_events` query
-/// defined in `./src/gabsurd/internal/sql/cleanup_events.sql`.
-///
-/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
-/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
-///
-pub type CleanupEventsRow {
-  CleanupEventsRow(cleanup_events: Int)
-}
-
-/// Runs the `cleanup_events` query
-/// defined in `./src/gabsurd/internal/sql/cleanup_events.sql`.
-///
-/// > 🐿️ This function was generated automatically using v4.7.0 of
-/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
-///
-pub fn cleanup_events(
-  db: pog.Connection,
-  arg_1: String,
-  arg_2: Int,
-  arg_3: Int,
-) -> Result(pog.Returned(CleanupEventsRow), pog.QueryError) {
-  let decoder = {
-    use cleanup_events <- decode.field(0, decode.int)
-    decode.success(CleanupEventsRow(cleanup_events:))
-  }
-
-  "SELECT absurd.cleanup_events($1, $2, $3) AS cleanup_events;
-"
-  |> pog.query
-  |> pog.parameter(pog.text(arg_1))
-  |> pog.parameter(pog.int(arg_2))
-  |> pog.parameter(pog.int(arg_3))
-  |> pog.returning(decoder)
-  |> pog.execute(db)
-}
-
-/// A row you get from running the `cleanup_tasks` query
-/// defined in `./src/gabsurd/internal/sql/cleanup_tasks.sql`.
-///
-/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
-/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
-///
-pub type CleanupTasksRow {
-  CleanupTasksRow(cleanup_tasks: Int)
-}
-
-/// Runs the `cleanup_tasks` query
-/// defined in `./src/gabsurd/internal/sql/cleanup_tasks.sql`.
-///
-/// > 🐿️ This function was generated automatically using v4.7.0 of
-/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
-///
-pub fn cleanup_tasks(
-  db: pog.Connection,
-  arg_1: String,
-  arg_2: Int,
-  arg_3: Int,
-) -> Result(pog.Returned(CleanupTasksRow), pog.QueryError) {
-  let decoder = {
-    use cleanup_tasks <- decode.field(0, decode.int)
-    decode.success(CleanupTasksRow(cleanup_tasks:))
-  }
-
-  "SELECT absurd.cleanup_tasks($1, $2, $3) AS cleanup_tasks;
-"
-  |> pog.query
-  |> pog.parameter(pog.text(arg_1))
-  |> pog.parameter(pog.int(arg_2))
-  |> pog.parameter(pog.int(arg_3))
-  |> pog.returning(decoder)
-  |> pog.execute(db)
-}
-
 /// A row you get from running the `complete_run` query
 /// defined in `./src/gabsurd/internal/sql/complete_run.sql`.
 ///
@@ -370,35 +402,41 @@ pub fn complete_run(
   |> pog.execute(db)
 }
 
-/// A row you get from running the `create_queue` query
-/// defined in `./src/gabsurd/internal/sql/create_queue.sql`.
+/// A row you get from running the `complete_run_if_claimed` query
+/// defined in `./src/gabsurd/internal/sql/complete_run_if_claimed.sql`.
 ///
 /// > 🐿️ This type definition was generated automatically using v4.7.0 of the
 /// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
 ///
-pub type CreateQueueRow {
-  CreateQueueRow(ignored: String)
+pub type CompleteRunIfClaimedRow {
+  CompleteRunIfClaimedRow(completed: Bool)
 }
 
-/// Runs the `create_queue` query
-/// defined in `./src/gabsurd/internal/sql/create_queue.sql`.
+/// Complete a run only while the original claim is active.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
 ///
-pub fn create_queue(
+pub fn complete_run_if_claimed(
   db: pog.Connection,
   arg_1: String,
-) -> Result(pog.Returned(CreateQueueRow), pog.QueryError) {
+  arg_2: Uuid,
+  arg_3: String,
+  arg_4: Json,
+) -> Result(pog.Returned(CompleteRunIfClaimedRow), pog.QueryError) {
   let decoder = {
-    use ignored <- decode.field(0, decode.string)
-    decode.success(CreateQueueRow(ignored:))
+    use completed <- decode.field(0, decode.bool)
+    decode.success(CompleteRunIfClaimedRow(completed:))
   }
 
-  "SELECT absurd.create_queue($1)::text AS ignored;
+  "-- Complete a run only while the original claim is active.
+SELECT gabsurd.complete_run_if_claimed($1, $2, $3, $4) AS completed;
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
+  |> pog.parameter(pog.text(uuid.to_string(arg_2)))
+  |> pog.parameter(pog.text(arg_3))
+  |> pog.parameter(pog.text(json.to_string(arg_4)))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -508,6 +546,47 @@ pub fn emit_event(
   |> pog.execute(db)
 }
 
+/// A row you get from running the `expired_claims` query
+/// defined in `./src/gabsurd/internal/sql/expired_claims.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type ExpiredClaimsRow {
+  ExpiredClaimsRow(run_id: Uuid, claim_owner: String)
+}
+
+/// Find the worker's expired leases without claiming any new work.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn expired_claims(
+  db: pog.Connection,
+  arg_1: String,
+  arg_2: List(Uuid),
+  arg_3: List(String),
+) -> Result(pog.Returned(ExpiredClaimsRow), pog.QueryError) {
+  let decoder = {
+    use run_id <- decode.field(0, uuid_decoder())
+    use claim_owner <- decode.field(1, decode.string)
+    decode.success(ExpiredClaimsRow(run_id:, claim_owner:))
+  }
+
+  "-- Find the worker's expired leases without claiming any new work.
+SELECT run_id, claim_owner
+FROM gabsurd.expired_claims($1, $2, $3);
+"
+  |> pog.query
+  |> pog.parameter(pog.text(arg_1))
+  |> pog.parameter(
+    pog.array(fn(value) { pog.text(uuid.to_string(value)) }, arg_2),
+  )
+  |> pog.parameter(pog.array(fn(value) { pog.text(value) }, arg_3))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
 /// A row you get from running the `extend_claim` query
 /// defined in `./src/gabsurd/internal/sql/extend_claim.sql`.
 ///
@@ -541,6 +620,45 @@ pub fn extend_claim(
   |> pog.parameter(pog.text(arg_1))
   |> pog.parameter(pog.text(uuid.to_string(arg_2)))
   |> pog.parameter(pog.int(arg_3))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `extend_claim_if_claimed` query
+/// defined in `./src/gabsurd/internal/sql/extend_claim_if_claimed.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type ExtendClaimIfClaimedRow {
+  ExtendClaimIfClaimedRow(extended: Bool)
+}
+
+/// Extend a lease only while the original claim is active.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn extend_claim_if_claimed(
+  db: pog.Connection,
+  arg_1: String,
+  arg_2: Uuid,
+  arg_3: String,
+  arg_4: Int,
+) -> Result(pog.Returned(ExtendClaimIfClaimedRow), pog.QueryError) {
+  let decoder = {
+    use extended <- decode.field(0, decode.bool)
+    decode.success(ExtendClaimIfClaimedRow(extended:))
+  }
+
+  "-- Extend a lease only while the original claim is active.
+SELECT gabsurd.extend_claim_if_claimed($1, $2, $3, $4) AS extended;
+"
+  |> pog.query
+  |> pog.parameter(pog.text(arg_1))
+  |> pog.parameter(pog.text(uuid.to_string(arg_2)))
+  |> pog.parameter(pog.text(arg_3))
+  |> pog.parameter(pog.int(arg_4))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -582,6 +700,45 @@ pub fn fail_run(
   |> pog.execute(db)
 }
 
+/// A row you get from running the `fail_run_if_claimed` query
+/// defined in `./src/gabsurd/internal/sql/fail_run_if_claimed.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type FailRunIfClaimedRow {
+  FailRunIfClaimedRow(failed: Bool)
+}
+
+/// Fail a run only while it is still owned by the same claim.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn fail_run_if_claimed(
+  db: pog.Connection,
+  arg_1: String,
+  arg_2: Uuid,
+  arg_3: String,
+  arg_4: Json,
+) -> Result(pog.Returned(FailRunIfClaimedRow), pog.QueryError) {
+  let decoder = {
+    use failed <- decode.field(0, decode.bool)
+    decode.success(FailRunIfClaimedRow(failed:))
+  }
+
+  "-- Fail a run only while it is still owned by the same claim.
+SELECT gabsurd.fail_run_if_claimed($1, $2, $3, $4) AS failed;
+"
+  |> pog.query
+  |> pog.parameter(pog.text(arg_1))
+  |> pog.parameter(pog.text(uuid.to_string(arg_2)))
+  |> pog.parameter(pog.text(arg_3))
+  |> pog.parameter(pog.text(json.to_string(arg_4)))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
 /// A row you get from running the `fail_run_with_retry` query
 /// defined in `./src/gabsurd/internal/sql/fail_run_with_retry.sql`.
 ///
@@ -617,77 +774,6 @@ SELECT absurd.fail_run($1, $2, $3, $4::timestamp AT TIME ZONE 'UTC')::text AS ig
   |> pog.parameter(pog.text(uuid.to_string(arg_2)))
   |> pog.parameter(pog.text(json.to_string(arg_3)))
   |> pog.parameter(pog.timestamp(arg_4))
-  |> pog.returning(decoder)
-  |> pog.execute(db)
-}
-
-/// A row you get from running the `get_queue_policy` query
-/// defined in `./src/gabsurd/internal/sql/get_queue_policy.sql`.
-///
-/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
-/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
-///
-pub type GetQueuePolicyRow {
-  GetQueuePolicyRow(
-    queue_name: String,
-    storage_mode: String,
-    default_partition: String,
-    partition_lookahead: String,
-    partition_lookback: String,
-    cleanup_ttl: String,
-    cleanup_limit: Int,
-    detach_mode: String,
-    detach_min_age: String,
-  )
-}
-
-/// Runs the `get_queue_policy` query
-/// defined in `./src/gabsurd/internal/sql/get_queue_policy.sql`.
-///
-/// > 🐿️ This function was generated automatically using v4.7.0 of
-/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
-///
-pub fn get_queue_policy(
-  db: pog.Connection,
-  arg_1: String,
-) -> Result(pog.Returned(GetQueuePolicyRow), pog.QueryError) {
-  let decoder = {
-    use queue_name <- decode.field(0, decode.string)
-    use storage_mode <- decode.field(1, decode.string)
-    use default_partition <- decode.field(2, decode.string)
-    use partition_lookahead <- decode.field(3, decode.string)
-    use partition_lookback <- decode.field(4, decode.string)
-    use cleanup_ttl <- decode.field(5, decode.string)
-    use cleanup_limit <- decode.field(6, decode.int)
-    use detach_mode <- decode.field(7, decode.string)
-    use detach_min_age <- decode.field(8, decode.string)
-    decode.success(GetQueuePolicyRow(
-      queue_name:,
-      storage_mode:,
-      default_partition:,
-      partition_lookahead:,
-      partition_lookback:,
-      cleanup_ttl:,
-      cleanup_limit:,
-      detach_mode:,
-      detach_min_age:,
-    ))
-  }
-
-  "SELECT
-  queue_name,
-  storage_mode,
-  default_partition,
-  partition_lookahead::text,
-  partition_lookback::text,
-  cleanup_ttl::text,
-  cleanup_limit,
-  detach_mode,
-  detach_min_age::text
-FROM absurd.get_queue_policy($1);
-"
-  |> pog.query
-  |> pog.parameter(pog.text(arg_1))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -784,65 +870,6 @@ FROM absurd.get_task_checkpoint_state($1, $2, $3, $4);
   |> pog.execute(db)
 }
 
-/// A row you get from running the `get_task_checkpoint_states` query
-/// defined in `./src/gabsurd/internal/sql/get_task_checkpoint_states.sql`.
-///
-/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
-/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
-///
-pub type GetTaskCheckpointStatesRow {
-  GetTaskCheckpointStatesRow(
-    checkpoint_name: String,
-    state: Option(String),
-    status: String,
-    owner_run_id: Option(Uuid),
-    updated_at: Timestamp,
-  )
-}
-
-/// Runs the `get_task_checkpoint_states` query
-/// defined in `./src/gabsurd/internal/sql/get_task_checkpoint_states.sql`.
-///
-/// > 🐿️ This function was generated automatically using v4.7.0 of
-/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
-///
-pub fn get_task_checkpoint_states(
-  db: pog.Connection,
-  arg_1: String,
-  arg_2: Uuid,
-  arg_3: Uuid,
-) -> Result(pog.Returned(GetTaskCheckpointStatesRow), pog.QueryError) {
-  let decoder = {
-    use checkpoint_name <- decode.field(0, decode.string)
-    use state <- decode.field(1, decode.optional(decode.string))
-    use status <- decode.field(2, decode.string)
-    use owner_run_id <- decode.field(3, decode.optional(uuid_decoder()))
-    use updated_at <- decode.field(4, pog.timestamp_decoder())
-    decode.success(GetTaskCheckpointStatesRow(
-      checkpoint_name:,
-      state:,
-      status:,
-      owner_run_id:,
-      updated_at:,
-    ))
-  }
-
-  "SELECT
-  checkpoint_name,
-  state AS \"state?\",
-  status,
-  owner_run_id AS \"owner_run_id?\",
-  updated_at AT TIME ZONE 'UTC' AS updated_at
-FROM absurd.get_task_checkpoint_states($1, $2, $3);
-"
-  |> pog.query
-  |> pog.parameter(pog.text(arg_1))
-  |> pog.parameter(pog.text(uuid.to_string(arg_2)))
-  |> pog.parameter(pog.text(uuid.to_string(arg_3)))
-  |> pog.returning(decoder)
-  |> pog.execute(db)
-}
-
 /// A row you get from running the `get_task_result` query
 /// defined in `./src/gabsurd/internal/sql/get_task_result.sql`.
 ///
@@ -853,7 +880,7 @@ pub type GetTaskResultRow {
   GetTaskResultRow(
     task_id: Uuid,
     task_name: String,
-    headers: String,
+    headers: Option(String),
     state: String,
     result: Option(String),
     failure_reason: Option(String),
@@ -874,7 +901,7 @@ pub fn get_task_result(
   let decoder = {
     use task_id <- decode.field(0, uuid_decoder())
     use task_name <- decode.field(1, decode.string)
-    use headers <- decode.field(2, decode.string)
+    use headers <- decode.field(2, decode.optional(decode.string))
     use state <- decode.field(3, decode.string)
     use result <- decode.field(4, decode.optional(decode.string))
     use failure_reason <- decode.field(5, decode.optional(decode.string))
@@ -891,7 +918,7 @@ pub fn get_task_result(
   "SELECT
   task_id,
   task_name,
-  headers,
+  headers AS \"headers?\",
   state,
   result AS \"result?\",
   failure_reason AS \"failure_reason?\"
@@ -987,7 +1014,7 @@ pub type ScheduleRunRow {
   ScheduleRunRow(ignored: String)
 }
 
-/// Interpret the encoded timestamp as UTC, not as session-local time.
+/// Schedule a run relative to the database clock.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
@@ -996,55 +1023,102 @@ pub fn schedule_run(
   db: pog.Connection,
   arg_1: String,
   arg_2: Uuid,
-  arg_3: Timestamp,
+  arg_3: Int,
 ) -> Result(pog.Returned(ScheduleRunRow), pog.QueryError) {
   let decoder = {
     use ignored <- decode.field(0, decode.string)
     decode.success(ScheduleRunRow(ignored:))
   }
 
-  "-- Interpret the encoded timestamp as UTC, not as session-local time.
-SELECT absurd.schedule_run($1, $2, $3::timestamp AT TIME ZONE 'UTC')::text AS ignored;
+  "-- Schedule a run relative to the database clock.
+SELECT absurd.schedule_run($1, $2, absurd.current_time() + make_interval(secs => $3::bigint))::text AS ignored;
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
   |> pog.parameter(pog.text(uuid.to_string(arg_2)))
-  |> pog.parameter(pog.timestamp(arg_3))
+  |> pog.parameter(pog.int(arg_3))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
 
-/// A row you get from running the `set_queue_policy` query
-/// defined in `./src/gabsurd/internal/sql/set_queue_policy.sql`.
+/// A row you get from running the `schedule_run_if_claimed` query
+/// defined in `./src/gabsurd/internal/sql/schedule_run_if_claimed.sql`.
 ///
 /// > 🐿️ This type definition was generated automatically using v4.7.0 of the
 /// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
 ///
-pub type SetQueuePolicyRow {
-  SetQueuePolicyRow(ignored: String)
+pub type ScheduleRunIfClaimedRow {
+  ScheduleRunIfClaimedRow(scheduled: Bool)
 }
 
-/// Runs the `set_queue_policy` query
-/// defined in `./src/gabsurd/internal/sql/set_queue_policy.sql`.
+/// Schedule a run only while the original claim is active.
 ///
 /// > 🐿️ This function was generated automatically using v4.7.0 of
 /// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
 ///
-pub fn set_queue_policy(
+pub fn schedule_run_if_claimed(
   db: pog.Connection,
   arg_1: String,
-  arg_2: Json,
-) -> Result(pog.Returned(SetQueuePolicyRow), pog.QueryError) {
+  arg_2: Uuid,
+  arg_3: String,
+  arg_4: Int,
+) -> Result(pog.Returned(ScheduleRunIfClaimedRow), pog.QueryError) {
   let decoder = {
-    use ignored <- decode.field(0, decode.string)
-    decode.success(SetQueuePolicyRow(ignored:))
+    use scheduled <- decode.field(0, decode.bool)
+    decode.success(ScheduleRunIfClaimedRow(scheduled:))
   }
 
-  "SELECT absurd.set_queue_policy($1, $2)::text AS ignored;
+  "-- Schedule a run only while the original claim is active.
+SELECT gabsurd.schedule_run_if_claimed($1, $2, $3, $4) AS scheduled;
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
-  |> pog.parameter(pog.text(json.to_string(arg_2)))
+  |> pog.parameter(pog.text(uuid.to_string(arg_2)))
+  |> pog.parameter(pog.text(arg_3))
+  |> pog.parameter(pog.int(arg_4))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `set_checkpoint_if_claimed` query
+/// defined in `./src/gabsurd/internal/sql/set_checkpoint_if_claimed.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type SetCheckpointIfClaimedRow {
+  SetCheckpointIfClaimedRow(saved: Bool)
+}
+
+/// Save a checkpoint only while the original claim is active.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn set_checkpoint_if_claimed(
+  db: pog.Connection,
+  arg_1: String,
+  arg_2: Uuid,
+  arg_3: String,
+  arg_4: String,
+  arg_5: Json,
+  arg_6: Int,
+) -> Result(pog.Returned(SetCheckpointIfClaimedRow), pog.QueryError) {
+  let decoder = {
+    use saved <- decode.field(0, decode.bool)
+    decode.success(SetCheckpointIfClaimedRow(saved:))
+  }
+
+  "-- Save a checkpoint only while the original claim is active.
+SELECT gabsurd.set_checkpoint_if_claimed($1, $2, $3, $4, $5, $6) AS saved;
+"
+  |> pog.query
+  |> pog.parameter(pog.text(arg_1))
+  |> pog.parameter(pog.text(uuid.to_string(arg_2)))
+  |> pog.parameter(pog.text(arg_3))
+  |> pog.parameter(pog.text(arg_4))
+  |> pog.parameter(pog.text(json.to_string(arg_5)))
+  |> pog.parameter(pog.int(arg_6))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -1079,7 +1153,7 @@ pub fn set_task_checkpoint_state(
     decode.success(SetTaskCheckpointStateRow(ignored:))
   }
 
-  "SELECT absurd.set_task_checkpoint_state($1, $2, $3, $4, $5, $6)::text AS ignored;
+  "SELECT gabsurd.set_task_checkpoint_state($1, $2, $3, $4, $5, $6)::text AS ignored;
 "
   |> pog.query
   |> pog.parameter(pog.text(arg_1))
