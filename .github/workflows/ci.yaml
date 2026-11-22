@@ -26,13 +26,13 @@ jobs:
 
       - run: gleam format --check src test
 
+      - run: make build
+
+      - run: make lint
+
       - name: Check generated queries and run tests
         run: |
           source .envrc
           docker compose up -d --wait db
           gleam run -m squirrel check
           gleam test
-
-      - name: Build the example
-        working-directory: examples/order_workflow
-        run: gleam build
