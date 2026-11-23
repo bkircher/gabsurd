@@ -253,6 +253,71 @@ begin
 end;
 $$;
 
+-- Save the deadline and schedule the same run under one claim lock.
+create or replace function gabsurd.sleep_if_claimed (
+  p_queue_name text,
+  p_run_id uuid,
+  p_owner text,
+  p_step_name text,
+  p_duration_seconds double precision,
+  p_wake_at timestamptz,
+  p_extend_by integer
+)
+  returns table (claim_lost boolean, should_suspend boolean)
+  language plpgsql
+as $$
+declare
+  v_task_id uuid := gabsurd.lock_active_claim(p_queue_name, p_run_id, p_owner);
+  v_state jsonb;
+  v_saved_deadline text;
+  v_deadline timestamptz;
+begin
+  if v_task_id is null then
+    return query select true, false;
+    return;
+  end if;
+
+  select c.state into v_state
+    from absurd.get_task_checkpoint_state(p_queue_name, v_task_id, p_step_name) c;
+  if found then
+    v_saved_deadline := v_state #>> '{}';
+    -- Reject values like 'now' and timestamps that use the session time zone.
+    if jsonb_typeof(v_state) is distinct from 'string'
+       or v_saved_deadline !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$' then
+      raise exception 'Sleep checkpoint "%" has an invalid deadline', p_step_name
+        using errcode = '22007';
+    end if;
+    v_deadline := v_saved_deadline::timestamptz;
+  else
+    if (p_duration_seconds is null) = (p_wake_at is null) then
+      raise exception 'Specify one sleep duration or wake time';
+    end if;
+    v_deadline := coalesce(
+      p_wake_at, absurd.current_time() + make_interval(secs => p_duration_seconds)
+    );
+
+    -- Store a UTC timestamp with a four-digit year so the SDKs can read it.
+    if v_deadline < timestamptz '0001-01-01 00:00:00+00'
+       or v_deadline >= timestamptz '10000-01-01 00:00:00+00' then
+      raise exception 'Sleep deadline is outside the supported timestamp range'
+        using errcode = '22008';
+    end if;
+    perform absurd.set_task_checkpoint_state(
+      p_queue_name, v_task_id, p_step_name,
+      to_jsonb(to_char(v_deadline at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"+00:00"')),
+      p_run_id, p_extend_by
+    );
+  end if;
+
+  if v_deadline > absurd.current_time() then
+    perform absurd.schedule_run(p_queue_name, p_run_id, v_deadline);
+    return query select false, true;
+  else
+    return query select false, false;
+  end if;
+end;
+$$;
+
 -- Check the task and hold the run lock through the checkpoint write.
 create or replace function gabsurd.set_task_checkpoint_state (
   p_queue_name text,

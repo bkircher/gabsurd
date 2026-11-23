@@ -1166,6 +1166,96 @@ pub fn set_task_checkpoint_state(
   |> pog.execute(db)
 }
 
+/// A row you get from running the `sleep_for_if_claimed` query
+/// defined in `./src/gabsurd/internal/sql/sleep_for_if_claimed.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type SleepForIfClaimedRow {
+  SleepForIfClaimedRow(claim_lost: Bool, should_suspend: Bool)
+}
+
+/// Calculate the deadline on the server only when the checkpoint is new.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn sleep_for_if_claimed(
+  db: pog.Connection,
+  arg_1: String,
+  arg_2: Uuid,
+  arg_3: String,
+  arg_4: String,
+  arg_5: Float,
+  arg_6: Int,
+) -> Result(pog.Returned(SleepForIfClaimedRow), pog.QueryError) {
+  let decoder = {
+    use claim_lost <- decode.field(0, decode.bool)
+    use should_suspend <- decode.field(1, decode.bool)
+    decode.success(SleepForIfClaimedRow(claim_lost:, should_suspend:))
+  }
+
+  "-- Calculate the deadline on the server only when the checkpoint is new.
+SELECT claim_lost, should_suspend
+FROM gabsurd.sleep_if_claimed($1, $2, $3, $4, $5, NULL::timestamptz, $6);
+"
+  |> pog.query
+  |> pog.parameter(pog.text(arg_1))
+  |> pog.parameter(pog.text(uuid.to_string(arg_2)))
+  |> pog.parameter(pog.text(arg_3))
+  |> pog.parameter(pog.text(arg_4))
+  |> pog.parameter(pog.float(arg_5))
+  |> pog.parameter(pog.int(arg_6))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `sleep_until_if_claimed` query
+/// defined in `./src/gabsurd/internal/sql/sleep_until_if_claimed.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type SleepUntilIfClaimedRow {
+  SleepUntilIfClaimedRow(claim_lost: Bool, should_suspend: Bool)
+}
+
+/// Interpret the encoded timestamp as UTC, not as session-local time.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn sleep_until_if_claimed(
+  db: pog.Connection,
+  arg_1: String,
+  arg_2: Uuid,
+  arg_3: String,
+  arg_4: String,
+  arg_5: Timestamp,
+  arg_6: Int,
+) -> Result(pog.Returned(SleepUntilIfClaimedRow), pog.QueryError) {
+  let decoder = {
+    use claim_lost <- decode.field(0, decode.bool)
+    use should_suspend <- decode.field(1, decode.bool)
+    decode.success(SleepUntilIfClaimedRow(claim_lost:, should_suspend:))
+  }
+
+  "-- Interpret the encoded timestamp as UTC, not as session-local time.
+SELECT claim_lost, should_suspend
+FROM gabsurd.sleep_if_claimed($1, $2, $3, $4, NULL::double precision, $5::timestamp AT TIME ZONE 'UTC', $6);
+"
+  |> pog.query
+  |> pog.parameter(pog.text(arg_1))
+  |> pog.parameter(pog.text(uuid.to_string(arg_2)))
+  |> pog.parameter(pog.text(arg_3))
+  |> pog.parameter(pog.text(arg_4))
+  |> pog.parameter(pog.timestamp(arg_5))
+  |> pog.parameter(pog.int(arg_6))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
 /// A row you get from running the `spawn_task` query
 /// defined in `./src/gabsurd/internal/sql/spawn_task.sql`.
 ///

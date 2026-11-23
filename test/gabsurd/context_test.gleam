@@ -9,6 +9,8 @@ import gabsurd/test_support
 import gleam/dynamic/decode
 import gleam/json
 import gleam/option.{None, Some}
+import gleam/time/duration
+import gleam/time/timestamp
 import gleeunit/should
 import pog
 
@@ -440,4 +442,190 @@ pub fn zero_second_wait_can_resume_immediately_test() -> Nil {
 
   first_wait |> should.equal(Ok(event.Suspended))
   second_wait |> should.equal(Ok(event.TimedOut))
+}
+
+fn saved_deadline(ctx: Context, name: String) -> timestamp.Timestamp {
+  let assert Ok(Some(state)) = context.get_checkpoint(ctx, name)
+  let assert Ok(text) = json.parse(state, decode.string)
+  let assert Ok(deadline) = timestamp.parse_rfc3339(text)
+  deadline
+}
+
+pub fn sleep_for_uses_database_time_and_replays_the_original_deadline_test() -> Nil {
+  use db, queue <- test_support.with_transaction_queue("context_sleep_for")
+  test_support.set_time(db, claim_start)
+  let first = spawn_and_claim(db, queue)
+  let assert Ok(deadline) = timestamp.parse_rfc3339("2025-01-02T03:04:06.25Z")
+
+  let outcome = context.sleep_for(first, "wait", duration.milliseconds(1250))
+
+  outcome |> should.equal(Ok(context.Suspended))
+  let assert Ok(task.Sleeping(..)) =
+    task.get_result(db, queue, context.task_id(first))
+  saved_deadline(first, "wait") |> should.equal(deadline)
+
+  test_support.set_time(db, "2025-01-02T03:04:06.249999Z")
+  task.claim(db, queue, "worker-2", lease.default_expiry, 1)
+  |> should.equal(Ok([]))
+
+  test_support.set_time(db, "2025-01-02T03:04:06.25Z")
+  let resumed =
+    claim_as(db:, queue:, owner: "worker-2", expiry: lease.default_expiry)
+  let replay = context.sleep_for(resumed, "wait", duration.hours(1))
+
+  context.run_id(resumed) |> should.equal(context.run_id(first))
+  context.attempt(resumed) |> should.equal(1)
+  replay |> should.equal(Ok(context.Ready))
+  saved_deadline(resumed, "wait") |> should.equal(deadline)
+}
+
+pub fn sleep_until_preserves_the_deadline_in_a_non_utc_session_test() -> Nil {
+  use db, queue <- test_support.with_transaction_queue("context_sleep_until")
+  test_support.set_time(db, claim_start)
+  let assert Ok(_) =
+    pog.query("SET LOCAL TIME ZONE 'America/Los_Angeles'")
+    |> pog.execute(client.connection(db))
+  let first = spawn_and_claim(db, queue)
+  let assert Ok(deadline) =
+    timestamp.parse_rfc3339("2025-01-02T04:04:20.123456+01:00")
+  let assert Ok(later) = timestamp.parse_rfc3339("2025-01-03T03:04:05Z")
+
+  let outcome = context.sleep_until(first, "wait", deadline)
+
+  outcome |> should.equal(Ok(context.Suspended))
+  saved_deadline(first, "wait") |> should.equal(deadline)
+  test_support.set_time(db, "2025-01-02T03:04:20.123455Z")
+  task.claim(db, queue, "worker", lease.default_expiry, 1)
+  |> should.equal(Ok([]))
+
+  test_support.set_time(db, "2025-01-02T03:04:20.123456Z")
+  let resumed = claim_context(db, queue)
+  let replay = context.sleep_until(resumed, "wait", later)
+
+  context.run_id(resumed) |> should.equal(context.run_id(first))
+  replay |> should.equal(Ok(context.Ready))
+}
+
+pub fn sleep_on_retry_before_the_deadline_uses_the_saved_deadline_test() -> Nil {
+  use db, queue <- test_support.with_transaction_queue("context_sleep_retry")
+  test_support.set_time(db, claim_start)
+  let first = spawn_and_claim(db, queue)
+  let assert Ok(context.Suspended) =
+    context.sleep_for(first, "wait", duration.seconds(15))
+  test_support.set_time(db, "2025-01-02T03:04:10Z")
+  let assert Ok(Nil) =
+    task.fail(db, queue, context.run_id(first), json.string("retry"))
+  let retry = claim_context(db, queue)
+
+  let outcome = context.sleep_for(retry, "wait", duration.hours(1))
+
+  context.attempt(retry) |> should.equal(2)
+  outcome |> should.equal(Ok(context.Suspended))
+  test_support.set_time(db, "2025-01-02T03:04:19.999999Z")
+  task.claim(db, queue, "worker", lease.default_expiry, 1)
+  |> should.equal(Ok([]))
+
+  test_support.set_time(db, "2025-01-02T03:04:20Z")
+  let resumed = claim_context(db, queue)
+  context.run_id(resumed) |> should.equal(context.run_id(retry))
+  context.sleep_for(resumed, "wait", duration.hours(1))
+  |> should.equal(Ok(context.Ready))
+}
+
+pub fn zero_duration_saves_a_deadline_without_suspending_test() -> Nil {
+  use db, queue <- test_support.with_transaction_queue("context_sleep_zero")
+  test_support.set_time(db, claim_start)
+  let ctx = spawn_and_claim(db, queue)
+  let assert Ok(deadline) = timestamp.parse_rfc3339(claim_start)
+
+  let outcome = context.sleep_for(ctx, "wait", duration.seconds(0))
+
+  outcome |> should.equal(Ok(context.Ready))
+  saved_deadline(ctx, "wait") |> should.equal(deadline)
+  let assert Ok(task.Running(..)) =
+    task.get_result(db, queue, context.task_id(ctx))
+  Nil
+}
+
+pub fn sleep_until_a_past_deadline_leaves_the_run_active_test() -> Nil {
+  use db, queue <- test_support.with_transaction_queue("context_sleep_past")
+  test_support.set_time(db, claim_start)
+  let ctx = spawn_and_claim(db, queue)
+  let assert Ok(deadline) = timestamp.parse_rfc3339("2025-01-02T03:04:04Z")
+
+  let outcome = context.sleep_until(ctx, "wait", deadline)
+
+  outcome |> should.equal(Ok(context.Ready))
+  saved_deadline(ctx, "wait") |> should.equal(deadline)
+  let assert Ok(task.Running(..)) =
+    task.get_result(db, queue, context.task_id(ctx))
+  Nil
+}
+
+pub fn sleep_cannot_write_at_lease_expiry_test() -> Nil {
+  use db, queue <- test_support.with_transaction_queue("context_sleep_expired")
+  test_support.set_time(db, claim_start)
+  let ctx = spawn_and_claim(db, queue)
+  test_support.set_time(db, claim_deadline)
+
+  let outcome = context.sleep_for(ctx, "wait", duration.hours(1))
+
+  outcome |> should.equal(Error(client.ClaimLost))
+  context.get_checkpoint(ctx, "wait") |> should.equal(Ok(None))
+  let retry = claim_context(db, queue)
+  context.attempt(retry) |> should.equal(2)
+}
+
+pub fn sleep_cannot_suspend_a_newer_claim_on_the_same_run_test() -> Nil {
+  use db, queue <- test_support.with_transaction_queue("context_sleep_stale")
+  test_support.set_time(db, claim_start)
+  let old = spawn_and_claim(db, queue)
+  let assert Ok(context.Suspended) =
+    context.sleep_for(old, "first", duration.seconds(5))
+  test_support.set_time(db, "2025-01-02T03:04:10Z")
+  let resumed =
+    claim_as(db:, queue:, owner: "worker-2", expiry: lease.default_expiry)
+
+  let outcome = context.sleep_for(old, "next", duration.hours(1))
+
+  context.run_id(resumed) |> should.equal(context.run_id(old))
+  outcome |> should.equal(Error(client.ClaimLost))
+  context.get_checkpoint(resumed, "next") |> should.equal(Ok(None))
+  context.heartbeat(resumed) |> should.equal(Ok(Nil))
+}
+
+pub fn sleep_rejects_a_checkpoint_that_is_not_an_absolute_time_test() -> Nil {
+  use db, queue <- test_support.with_transaction_queue("context_sleep_invalid")
+  test_support.set_time(db, claim_start)
+  let ctx = spawn_and_claim(db, queue)
+  let assert Ok(Nil) = context.set_checkpoint(ctx, "wait", json.string("now"))
+
+  let outcome = context.sleep_for(ctx, "wait", duration.hours(1))
+
+  let assert Error(client.PostgresqlError(sqlstate: "22007", ..)) = outcome
+  Nil
+}
+
+pub fn sleep_reports_task_cancellation_test() -> Nil {
+  use db, queue <- test_support.with_transaction_queue(
+    "context_sleep_cancelled",
+  )
+  let ctx = spawn_and_claim(db, queue)
+  let assert Ok(Nil) = task.cancel(db, queue, context.task_id(ctx))
+
+  let outcome = context.sleep_for(ctx, "wait", duration.hours(1))
+
+  outcome |> should.equal(Error(client.TaskCancelled))
+}
+
+pub fn sleep_reports_an_already_failed_run_test() -> Nil {
+  use db, queue <- test_support.with_transaction_queue("context_sleep_failed")
+  let ctx = spawn_and_claim(db, queue)
+  let assert Ok(Nil) =
+    task.fail(db, queue, context.run_id(ctx), json.string("retry"))
+
+  let outcome = context.sleep_for(ctx, "wait", duration.hours(1))
+
+  let assert Error(client.RunAlreadyFailed(_)) = outcome
+  Nil
 }

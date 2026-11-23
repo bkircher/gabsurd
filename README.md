@@ -267,6 +267,7 @@ Execution context passed to worker handlers.
 | Type          | Description                                                   |
 | ------------- | ------------------------------------------------------------- |
 | `Context`     | Contains the database, queue, claim, owner, and claim expiry  |
+| `SleepResult` | `Ready` or `Suspended`                                        |
 
 | Function                                | Description                                   |
 | --------------------------------------- | --------------------------------------------- |
@@ -281,6 +282,8 @@ Execution context passed to worker handlers.
 | `get_checkpoint(ctx, name)`             | Get raw JSON state for a step                 |
 | `set_checkpoint(ctx, name, state)`      | Save a checkpoint and renew the lease, if set |
 | `heartbeat(ctx)`                        | Check ownership and renew the lease, if set   |
+| `sleep_for(ctx, name, duration)`        | Wait for a `gleam/time/duration.Duration`     |
+| `sleep_until(ctx, name, wake_at)`       | Wait until a `gleam/time/timestamp.Timestamp` |
 | `await_event(ctx, event_name, timeout)` | Await an event and return `event.AwaitResult` |
 
 ### `gabsurd/utility`
@@ -469,6 +472,35 @@ fn order_workflow(ctx) -> Result(Nil, client.GabsurdError) {
 fn charge_id_decoder() -> decode.Decoder(String) {
   use charge_id <- decode.field("charge_id", decode.string)
   decode.success(charge_id)
+}
+```
+
+### Durable Sleep
+
+Use `context.sleep_for` for a duration or `context.sleep_until` for an absolute
+deadline. Give each wait a stable, unique step name. The first call saves the
+deadline in PostgreSQL. When the handler runs again, it uses the saved
+deadline even if the supplied duration or timestamp has changed.
+
+The database clock determines when the deadline is due. Return
+`worker.Suspend` on `context.Suspended` to release the worker slot. The run
+can be claimed again at its deadline without using another attempt. On
+`context.Ready`, the deadline is due or has passed. Continue the workflow.
+
+```gleam
+import gabsurd/client
+import gabsurd/context
+import gabsurd/worker
+import gleam/json
+import gleam/time/duration
+
+fn cool_down(ctx: context.Context) -> worker.HandlerResult {
+  case context.sleep_for(ctx, "cooldown", duration.minutes(15)) {
+    Ok(context.Ready) -> worker.Complete(json.string("ready"))
+    Ok(context.Suspended) -> worker.Suspend
+    Error(client.TaskCancelled) -> worker.Cancelled
+    Error(error) -> worker.Fail(json.string(client.error_message(error)))
+  }
 }
 ```
 

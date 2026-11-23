@@ -17,6 +17,7 @@ import gleam/option
 import gleam/otp/static_supervisor
 import gleam/otp/supervision
 import gleam/string
+import gleam/time/duration
 import gleeunit/should
 import pog
 import youid/uuid
@@ -720,5 +721,44 @@ pub fn worker_suspends_and_resumes_a_task_on_event_test() -> Nil {
   let assert Ok(task.Completed(result: option.Some("1"), ..)) =
     task.get_result(db, q, info.task_id)
 
+  teardown(db, q)
+}
+
+pub fn sleeping_task_releases_the_workers_only_slot_test() -> Nil {
+  let #(db, q) = setup("worker_sleep_slot")
+  let sleeps = process.new_subject()
+  let other_runs = process.new_subject()
+  let handler =
+    Handler(
+      task_name: "wait",
+      execute: fn(ctx) {
+        let outcome = context.sleep_for(ctx, "wait", duration.hours(1))
+        process.send(sleeps, outcome)
+        case outcome {
+          Ok(context.Suspended) -> worker.Suspend
+          Ok(context.Ready) -> Complete(json.null())
+          Error(client.TaskCancelled) -> worker.Cancelled
+          Error(error) -> Fail(json.string(client.error_message(error)))
+        }
+      },
+      on_error: option.None,
+    )
+  let assert Ok(sleeper) =
+    task.spawn(db, q, "wait", json.null(), task.new_options())
+  let assert Ok(started) =
+    worker.new(db, q, [handler, tracking_handler("other", other_runs)])
+    |> worker.with_poll_interval(delay_ms(20))
+    |> worker.with_batch_size(1)
+    |> worker.start
+  process.receive(sleeps, 5000)
+  |> should.equal(Ok(Ok(context.Suspended)))
+
+  let assert Ok(other) =
+    task.spawn(db, q, "other", json.null(), task.new_options())
+
+  process.receive(other_runs, 5000) |> should.equal(Ok(Nil))
+  expect_worker_stop(started.data)
+  let assert Ok(task.Completed(..)) = task.get_result(db, q, other.task_id)
+  let assert Ok(task.Sleeping(..)) = task.get_result(db, q, sleeper.task_id)
   teardown(db, q)
 }

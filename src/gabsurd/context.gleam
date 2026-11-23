@@ -3,7 +3,8 @@
 //// Constructed by the worker and passed to your handler. Encapsulates
 //// the database connection, queue, claim details, and claim expiry so
 //// you don't have to pass them around. Provides high-level operations
-//// for idempotent steps, checkpoints, heartbeats, and event coordination.
+//// for idempotent steps, checkpoints, heartbeats, durable sleep, and event
+//// coordination.
 ////
 //// ## Example
 ////
@@ -45,6 +46,8 @@ import gleam/function
 import gleam/json
 import gleam/option
 import gleam/result
+import gleam/time/duration.{type Duration}
+import gleam/time/timestamp.{type Timestamp}
 
 // ============================================================================
 // Public Types
@@ -61,6 +64,14 @@ pub type Context {
     claim_owner: String,
     claim_expiry: ClaimExpiry,
   )
+}
+
+/// The result of a durable sleep.
+pub type SleepResult {
+  /// The saved deadline is at or before the current database time.
+  Ready
+  /// The run is asleep. Return `worker.Suspend` from the handler.
+  Suspended
 }
 
 /// An error from a fallible step.
@@ -263,6 +274,80 @@ pub fn heartbeat(ctx: Context) -> Result(Nil, GabsurdError) {
     lease.to_sql_seconds(ctx.claim_expiry),
   )
   |> query.claim_write(fn(row) { row.extended })
+}
+
+// ============================================================================
+// Durable Sleep
+// ============================================================================
+
+/// Sleep for a duration measured by the database clock, with microsecond
+/// precision.
+///
+/// Use a stable, unique step name. The first call saves the wake time in a
+/// task checkpoint. Later calls with the same name use that deadline and ignore
+/// the new duration. A deadline at or before database time returns `Ready`.
+///
+/// Return `worker.Suspend` from the handler on `Suspended`. The database
+/// schedules the same run without using a worker slot or an extra attempt.
+/// An inactive claim returns `ClaimLost` unless the task was cancelled or
+/// the run already failed.
+pub fn sleep_for(
+  ctx ctx: Context,
+  name name: String,
+  duration wait: Duration,
+) -> Result(SleepResult, GabsurdError) {
+  let RunId(run_uuid) = ctx.claim.run_id
+  use row <- result.try(
+    sql.sleep_for_if_claimed(
+      client.connection(ctx.db),
+      ctx.queue_name,
+      run_uuid,
+      ctx.claim_owner,
+      name,
+      duration.to_seconds(wait),
+      lease.to_sql_seconds(ctx.claim_expiry),
+    )
+    |> query.one,
+  )
+  sleep_result(row.claim_lost, row.should_suspend)
+}
+
+/// Sleep until an absolute deadline. The database stores it with microsecond
+/// precision and compares it with the database clock.
+///
+/// Like `sleep_for`, use a stable, unique step name. The first saved deadline
+/// takes precedence over the supplied timestamp on all later calls. Return
+/// `worker.Suspend` from the handler on `Suspended`.
+pub fn sleep_until(
+  ctx ctx: Context,
+  name name: String,
+  wake_at wake_at: Timestamp,
+) -> Result(SleepResult, GabsurdError) {
+  let RunId(run_uuid) = ctx.claim.run_id
+  use row <- result.try(
+    sql.sleep_until_if_claimed(
+      client.connection(ctx.db),
+      ctx.queue_name,
+      run_uuid,
+      ctx.claim_owner,
+      name,
+      wake_at,
+      lease.to_sql_seconds(ctx.claim_expiry),
+    )
+    |> query.one,
+  )
+  sleep_result(row.claim_lost, row.should_suspend)
+}
+
+fn sleep_result(
+  claim_lost: Bool,
+  should_suspend: Bool,
+) -> Result(SleepResult, GabsurdError) {
+  case claim_lost, should_suspend {
+    True, _ -> Error(client.ClaimLost)
+    False, True -> Ok(Suspended)
+    False, False -> Ok(Ready)
+  }
 }
 
 // ============================================================================
